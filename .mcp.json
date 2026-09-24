@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "voice": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/bridge.mjs"],
+      "env": { "TTC_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}" },
+      "timeout": 1800000
+    }
+  }
+}

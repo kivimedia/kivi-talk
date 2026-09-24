@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.env
+.env.*
+test/e2e/out/
+plans/

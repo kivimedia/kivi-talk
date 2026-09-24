@@ -1,0 +1,22 @@
+{
+  "name": "talk-to-claude",
+  "version": "0.1.0",
+  "description": "Talk out loud to the Claude Code session you are in. OpenAI gpt-live-1 is the voice (your own OpenAI key); your session does the work with its own tools while you talk.",
+  "author": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
+  "repository": "https://github.com/kivimedia/talk-to-claude",
+  "keywords": ["voice", "speech", "hands-free", "gpt-live-1", "call"],
+  "userConfig": {
+    "openai_api_key": {
+      "type": "string",
+      "title": "OpenAI API key",
+      "description": "Your own OpenAI API key (starts with sk-). Used only to open gpt-live-1 voice sessions, billed to your OpenAI account, about $0.05 a minute while a call is live. You can leave this empty and paste it on the call page the first time instead.",
+      "sensitive": true
+    },
+    "keep_transcripts": {
+      "type": "boolean",
+      "title": "Keep call transcripts",
+      "description": "Save what was said on each call to a file in the plugin's data folder on this computer. Off by default; the call is always summarised in your Claude session either way.",
+      "default": false
+    }
+  }
+}

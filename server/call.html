@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>Talk to Claude</title>
+<style nonce="__NONCE__">
+:root {
+  color-scheme: light dark;
+  --bg: #eef1f5; --card: #ffffff; --text: #0f172a; --muted: #334155; --line: #cbd5e1;
+  --go: #0f766e; --go-text: #ffffff; --stop: #b91c1c; --stop-text: #ffffff;
+  --you: #1d4ed8; --voice: #6d28d9; --claude: #0f766e; --err: #b91c1c; --note: #92400e;
+  --field: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1017; --card: #131b26; --text: #e6edf3; --muted: #c2ccd7; --line: #2b3847;
+    --go: #14b8a6; --go-text: #04201d; --stop: #ef4444; --stop-text: #1f0505;
+    --you: #93c5fd; --voice: #c4b5fd; --claude: #5eead4; --err: #fca5a5; --note: #fcd34d;
+    --field: #0e151e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 20px 16px 40px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+h1 { font-size: 22px; margin: 0; }
+h2 { font-size: 16px; margin: 0 0 10px; }
+#project { color: var(--muted); font-size: 14px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+#status { font-size: 20px; font-weight: 600; margin: 0; }
+#detail { color: var(--muted); margin: 4px 0 0; min-height: 1.5em; overflow-wrap: anywhere; }
+#claudeLine { color: var(--muted); margin: 10px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+.row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 14px; }
+button {
+  font: inherit; font-weight: 600; border: 1px solid transparent; border-radius: 8px;
+  padding: 10px 18px; cursor: pointer; background: var(--go); color: var(--go-text);
+}
+button.stop { background: var(--stop); color: var(--stop-text); }
+button.plain { background: transparent; color: var(--text); border-color: var(--line); font-weight: 500; padding: 8px 12px; }
+button:disabled { opacity: 0.6; cursor: default; }
+#go { min-width: 170px; font-size: 17px; padding: 12px 20px; }
+.meter { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+#interim { color: var(--muted); font-style: normal; min-height: 1.5em; margin: 0 0 8px; overflow-wrap: anywhere; }
+#log { list-style: none; margin: 0; padding: 0; max-height: 46vh; overflow-y: auto; }
+#log li { padding: 6px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+#log li:first-child { border-top: 0; }
+#log .who { font-weight: 700; margin-right: 6px; }
+#log .you .who { color: var(--you); }
+#log .voice .who { color: var(--voice); }
+#log .claude .who, #log .work .who, #log .progress .who { color: var(--claude); }
+#log .err .who { color: var(--err); }
+#log .note .who { color: var(--note); }
+form.inline { display: flex; gap: 8px; margin-top: 12px; }
+input[type=text], input[type=password] {
+  flex: 1; min-width: 0; font: inherit; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--field); color: var(--text);
+}
+#keyBox p { margin: 0 0 8px; color: var(--muted); }
+#keyMsg { min-height: 1.5em; overflow-wrap: anywhere; }
+#confirmBox { border: 2px solid var(--note); }
+#confirmWhy { margin: 0 0 8px; }
+#confirmAction {
+  margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--field); border: 1px solid var(--line);
+  white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  max-height: 40vh; overflow-y: auto;
+}
+footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Talk to Claude</h1>
+    <span id="project"></span>
+  </header>
+
+  <section class="card" aria-labelledby="status">
+    <p id="status" role="status" aria-live="polite">Ready.</p>
+    <p id="detail"></p>
+    <div class="row">
+      <button id="go" type="button">Start talking</button>
+      <button id="mute" class="plain" type="button" hidden>Mute</button>
+      <span class="meter"><span id="clock">0:00</span> live · about <span id="cost">$0.00</span> · <span id="model"></span></span>
+    </div>
+    <p id="claudeLine"></p>
+  </section>
+
+  <section class="card" id="confirmBox" hidden aria-live="assertive">
+    <h2>Claude is asking for your approval</h2>
+    <p id="confirmWhy"></p>
+    <pre id="confirmAction"></pre>
+    <div class="row">
+      <button id="approve" type="button">Approve</button>
+      <button id="decline" class="stop" type="button">Decline</button>
+      <span class="meter" id="confirmClock"></span>
+    </div>
+  </section>
+
+  <section class="card" id="keyBox" hidden>
+    <h2>Your OpenAI API key</h2>
+    <p>The voice runs on OpenAI gpt-live-1, billed to your own OpenAI account (about $<span id="price">0.05</span> a minute while a call is live).</p>
+    <p>The key is checked with OpenAI, then saved only on this computer, in <span id="cfgPath"></span>. It never reaches this page again.</p>
+    <form class="inline" id="keyForm" autocomplete="off">
+      <input id="key" type="password" placeholder="sk-..." aria-label="OpenAI API key" spellcheck="false">
+      <button type="submit">Save key</button>
+    </form>
+    <p id="keyMsg" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="card">
+    <h2>Conversation</h2>
+    <p id="interim"></p>
+    <ol id="log"></ol>
+    <form class="inline" id="typeForm" autocomplete="off">
+      <input id="typed" type="text" placeholder="Or type a request for Claude" aria-label="Type a request for Claude">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+
+  <footer>
+    <span id="keyLine"></span>
+    <button class="plain" id="changeKey" type="button">Change key</button>
+    <p>Your voice goes to OpenAI to be heard and spoken. Claude does the work on this computer; only what it says out loud goes back to OpenAI.</p>
+  </footer>
+</main>
+
+<script type="application/json" id="cfg">__CONFIG__</script>
+<script nonce="__NONCE__">
+(function () {
+  "use strict";
+  var CFG = JSON.parse(document.getElementById("cfg").textContent);
+  var BASE = location.pathname.replace(/\/+$/, "");
+  function $(id) { return document.getElementById(id); }
+  function noop() {}
+
+  var pc = null, dc = null, mic = null, audioEl = null, es = null;
+  var phase = "idle";                   // idle | connecting | live | closing | ended
+  var startedAt = 0, lastActivity = 0, usage = null, warnedMax = false;
+  var closeTimer = null, connectTimer = null, closingReason = "";
+  var heardBuf = "", saidBuf = "", sinceHandover = [], recent = [];
+  var claude = { claude: CFG.claude || "away", queue: CFG.queue || 0, on: CFG.on || "" };
+  var workingSince = 0;
+  var sseDownSince = 0, seq = 0;
+
+  /* A caller can only trust a status line that says exactly what is happening now. */
+  function setStatus(main, detail) {
+    $("status").textContent = main;
+    $("detail").textContent = detail || "";
+  }
+
+  function addLine(who, text, cls) {
+    var li = document.createElement("li");
+    li.className = cls || "";
+    var b = document.createElement("span");
+    b.className = "who";
+    b.textContent = who;
+    var t = document.createElement("span");
+    t.textContent = text;
+    li.appendChild(b);
+    li.appendChild(t);
+    var log = $("log");
+    var atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.appendChild(li);
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  function showInterim(who, text) { $("interim").textContent = who + ": " + text; }
+  function clearInterim() { $("interim").textContent = ""; }
+
+  function api(p, body, keepalive) {
+    return fetch(BASE + p, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body || {}),
+      keepalive: Boolean(keepalive),
+    });
+  }
+
+  function mmss(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  }
+
+  /* ------------------------------------------------------------ render -- */
+
+  function render() {
+    var go = $("go");
+    go.disabled = false;
+    go.className = "";
+    if (phase === "idle") go.textContent = "Start talking";
+    else if (phase === "connecting") { go.textContent = "Cancel"; go.className = "stop"; }
+    else if (phase === "live") { go.textContent = "End call"; go.className = "stop"; }
+    else if (phase === "closing") { go.textContent = "Hanging up..."; go.disabled = true; }
+    else { go.textContent = "Call ended"; go.disabled = true; }
+    $("mute").hidden = phase !== "live";
+
+    $("project").textContent = CFG.project ? "in " + CFG.project + (CFG.focus ? " · " + CFG.focus : "") : "";
+    $("model").textContent = CFG.model;
+    $("price").textContent = String(CFG.pricePerMinute);
+    $("cfgPath").textContent = CFG.configFile;
+    $("keyLine").textContent = CFG.keyPresent ? "OpenAI key: " + CFG.keySource + (CFG.keyHint ? " (" + CFG.keyHint + ")" : "") + "." : "No OpenAI key yet.";
+    renderClaude();
+  }
+
+  function renderClaude() {
+    var line;
+    if (phase === "ended") line = "";
+    else if (claude.claude === "working") line = "Claude is working on: “" + (claude.on || "your request") + "”" + (workingSince ? " (" + mmss(Date.now() - workingSince) + ")" : "");
+    else if (claude.claude === "listening") line = "Claude is ready for the next request.";
+    else line = "Claude is not in the call loop right now (it may be busy in its own window). Requests wait for it.";
+    if (claude.queue > 0 && phase !== "ended") line += " " + claude.queue + " more waiting.";
+    $("claudeLine").textContent = line;
+  }
+
+  function showKey(msg) {
+    $("keyBox").hidden = false;
+    $("keyMsg").textContent = msg || "";
+    $("key").focus();
+  }
+
+  /* ------------------------------------------------------- the server -- */
+
+  function connectEvents() {
+    es = new EventSource(BASE + "/events");
+    es.onopen = function () { sseDownSince = 0; };
+    es.onmessage = function (e) {
+      var m;
+      try { m = JSON.parse(e.data); } catch (x) { return; }
+      onServer(m);
+    };
+    es.onerror = function () { if (!sseDownSince) sseDownSince = Date.now(); };
+  }
+
+  function onServer(m) {
+    if (m.type === "hello") {
+      ["keyPresent", "keySource", "keyHint", "configFile", "model", "project", "focus",
+       "idleMinutes", "maxMinutes", "pricePerMinute"].forEach(function (k) { if (k in m) CFG[k] = m[k]; });
+      claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
+      if (m.state === "ended") {
+        if (phase === "live" || phase === "connecting") hangUp("Claude ended the call.");
+        else if (phase !== "ended") { phase = "ended"; setStatus("This call has ended.", (m.endReason || "") + " Run /talk-to-claude in Claude to call again."); }
+      }
+      render();
+      return;
+    }
+    if (m.type === "status") {
+      if (m.claude === "working" && claude.claude !== "working") workingSince = Date.now();
+      claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
+      renderClaude();
+      return;
+    }
+    if (m.type === "working") {
+      lastActivity = Date.now();
+      workingSince = Date.now();
+      addLine("Claude", "working on “" + m.text + "”", "work");
+      if (phase === "live") setStatus("Claude is working.", m.text);
+      // Quiet context, not speech: the voice knows Claude has started if the user asks.
+      thinking(lastOf(m.delegationIds), "Claude has started working on: " + m.text + ". No result yet.");
+      return;
+    }
+    if (m.type === "say") { onSay(m); return; }
+    if (m.type === "confirm") { showConfirm(m); return; }
+    if (m.type === "confirm_done") {
+      if (confirmOpen && confirmOpen.id === m.id) {
+        hideConfirm();
+        if (m.expired) addLine("Call", "the approval request timed out, so Claude will not do it", "note");
+      }
+      return;
+    }
+    if (m.type === "notify") {
+      addLine("Notice", m.text, "note");
+      commentary(null, "Tell the user this, briefly: " + m.text);
+      return;
+    }
+    if (m.type === "end") {
+      var why = m.reason || "Claude ended the call.";
+      // Let the goodbye Claude just sent finish playing before the line goes dead.
+      if (phase === "live") { setStatus("Hanging up...", why); setTimeout(function () { hangUp(why); }, 3500); }
+      else hangUp(why);
+      return;
+    }
+  }
+
+  function lastOf(a) { return (a && a.length) ? a[a.length - 1] : null; }
+
+  /* One delegation can carry several updates (OpenAI: "You can send multiple updates with the
+     same client delegation ID"), so progress, a queue notice and the final answer all go out
+     under the id of the request they belong to. Typed requests have none and go out as null. */
+  function onSay(m) {
+    lastActivity = Date.now();
+    flushSaid();   // whatever the voice said before this answer belongs above it
+    addLine("Claude", m.text, m.final ? "claude" : "progress");
+    if (phase === "live") setStatus(m.final ? "Claude answered." : "Claude is still working.", m.text);
+    commentary(lastOf(m.delegationIds), m.final
+      ? "Claude's answer: " + m.text
+      : "Progress note from Claude (the work is still running): " + m.text);
+  }
+
+  /* -------------------------------------------------------- the voice -- */
+
+  function liveSend(obj) {
+    if (!dc || dc.readyState !== "open") return false;
+    try { dc.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+  }
+
+  function commentary(delegationId, content) {
+    return liveSend({
+      type: "session.commentary.append",
+      event_id: "c" + Date.now() + "_" + (++seq),
+      delegation_id: delegationId || null,
+      content: String(content).slice(0, 1100),
+    });
+  }
+
+  function thinking(delegationId, content) {
+    return liveSend({
+      type: "session.thinking.append",
+      event_id: "t" + Date.now() + "_" + (++seq),
+      delegation_id: delegationId || null,
+      content: String(content).slice(0, 1100),
+    });
+  }
+
+  function instruct(content) {
+    return liveSend({
+      type: "session.instructions.append",
+      event_id: "i" + Date.now() + "_" + (++seq),
+      delegation_id: null,
+      content: content,
+    });
+  }
+
+  /* ICE has to finish before the offer leaves: the offer is the whole negotiation, there is
+     no trickle path back to OpenAI afterwards. */
+  function iceSettled(conn) {
+    if (conn.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () {
+        conn.removeEventListener("icegatheringstatechange", onState);
+        reject(new Error("timed out gathering network routes (ICE)"));
+      }, 10000);
+      function onState() {
+        if (conn.iceGatheringState !== "complete") return;
+        clearTimeout(timer);
+        conn.removeEventListener("icegatheringstatechange", onState);
+        resolve();
+      }
+      conn.addEventListener("icegatheringstatechange", onState);
+    });
+  }
+
+  async function start() {
+    if (phase === "live" || phase === "connecting") { hangUp("You ended the call."); return; }
+    if (phase !== "idle") return;
+    if (!CFG.keyPresent) { showKey(); setStatus("Add your OpenAI key to start.", "It is used only to open the voice session."); return; }
+    phase = "connecting";
+    render();
+    // Created inside the click, so the browser lets it play without another gesture.
+    audioEl = new Audio();
+    audioEl.autoplay = true;
+    try {
+      setStatus("Asking for your microphone...", "Allow microphone access if the browser asks.");
+      mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (phase !== "connecting") { teardown(); return; }
+      setStatus("Connecting to OpenAI " + CFG.model + "...", "Setting up the audio link.");
+      pc = new RTCPeerConnection();
+      pc.ontrack = function (e) { audioEl.srcObject = e.streams[0]; audioEl.play().catch(noop); };
+      /* "disconnected" is a blip that usually recovers by itself; only "failed" is final. */
+      pc.onconnectionstatechange = function () {
+        if (pc && pc.connectionState === "failed") hangUp("The voice connection failed.");
+      };
+      mic.getTracks().forEach(function (t) { pc.addTrack(t, mic); });
+      dc = pc.createDataChannel("oai-events");
+      dc.onmessage = function (e) {
+        var ev;
+        try { ev = JSON.parse(e.data); } catch (x) { return; }
+        onLive(ev);
+      };
+      await pc.setLocalDescription(await pc.createOffer());
+      setStatus("Connecting to OpenAI " + CFG.model + "...", "Gathering network routes.");
+      await iceSettled(pc);
+      if (phase !== "connecting") { teardown(); return; }
+      setStatus("Connecting to OpenAI " + CFG.model + "...", "Opening the voice session. Your key stays inside the Claude process.");
+      var r = await api("/live", { sdp: pc.localDescription.sdp });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok || !j.sdp) {
+        if (j.needKey) { CFG.keyPresent = false; render(); showKey(j.error); }
+        throw new Error(j.error || "OpenAI would not open the voice session.");
+      }
+      if (phase !== "connecting") { teardown(); return; }
+      await pc.setRemoteDescription({ type: "answer", sdp: j.sdp });
+      setStatus("Connecting audio...", "Waiting for OpenAI to start the session.");
+      connectTimer = setTimeout(function () {
+        if (phase === "connecting") hangUp("The voice session did not start within 20 seconds.");
+      }, 20000);
+    } catch (e) {
+      teardown();
+      if (phase === "connecting") phase = "idle";
+      render();
+      var msg = String((e && e.message) || e);
+      if (e && e.name === "NotAllowedError") msg = "The browser blocked the microphone. Allow it for this page and press Start again.";
+      setStatus("Could not start the call.", msg);
+    }
+  }
+
+  function onLive(ev) {
+    var t = ev.type;
+    if (t === "session.started") {
+      clearTimeout(connectTimer);
+      phase = "live";
+      startedAt = Date.now();
+      lastActivity = startedAt;
+      api("/state", { state: "live" }).catch(noop);
+      /* Live has no response.create to make it speak first; an instruction append is how it is
+         told to open, and it only counts once the session is actually up. */
+      instruct("Greet the user now in one short sentence: say Claude is listening and ask what to work on. Then stop and listen.");
+      setStatus("Listening.", "Talk whenever you are ready. Say “bye” or press End call to hang up.");
+      render();
+      return;
+    }
+    if (t === "session.input_transcript.delta") {
+      if (saidBuf.trim()) flushSaid();
+      heardBuf += ev.delta || "";
+      lastActivity = Date.now();
+      showInterim("You", heardBuf);
+      settle("heard", flushHeard, 2000);
+      return;
+    }
+    if (t === "session.output_transcript.delta") {
+      if (heardBuf.trim()) flushHeard();
+      saidBuf += ev.delta || "";
+      showInterim("Voice", saidBuf);
+      settle("said", flushSaid, 1500);
+      return;
+    }
+    if (t === "session.delegation.created") {
+      onDelegation(ev.delegation && ev.delegation.id);
+      return;
+    }
+    if (t === "session.usage.updated") { usage = ev.usage || usage; return; }
+    if (t === "session.closed") {
+      usage = ev.usage || usage;
+      finish(closingReason || "The voice session closed.");
+      return;
+    }
+    if (t === "error") {
+      var err = ev.error || ev;
+      addLine("Error", (err && (err.message || err.code)) ? String(err.message || err.code) : JSON.stringify(err).slice(0, 200), "err");
+    }
+  }
+
+  /* Transcripts arrive as fragments on both sides at once (Live is full duplex), with no event
+     marking the end of a turn. Each side accumulates, and becomes a line when the other side
+     starts or when a hand-over needs it. */
+  /* There is no end-of-turn event, so a line is also written down once its side has been quiet
+     for a moment; otherwise the last thing said sits in the caption until someone speaks. */
+  var settleTimers = {};
+  function settle(key, fn, ms) {
+    clearTimeout(settleTimers[key]);
+    settleTimers[key] = setTimeout(fn, ms);
+  }
+
+  var HANGUP =/^\s*(?:(?:ok(?:ay)?|thanks?|thank you|great|perfect)[,.!]?\s*)*(?:please\s+)?(?:hang up|end (?:the|this) call|bye(?:[- ]bye)?|good ?bye)(?:\s+(?:claude|now|for now))?[\s.!]*$/i;
+
+  function flushHeard() {
+    var t = heardBuf.trim();
+    heardBuf = "";
+    if (!t) return;
+    clearInterim();
+    addLine("You", t, "you");
+    recent.push({ role: "user", text: t });
+    if (recent.length > 24) recent.shift();
+    sinceHandover.push(t);
+    api("/transcript", { role: "user", text: t }).catch(noop);
+    if (HANGUP.test(t) && phase === "live") {
+      instruct("The user is ending the call. Say a short goodbye, nothing else.");
+      setTimeout(function () { hangUp("You said goodbye."); }, 4500);
+    }
+  }
+
+  function flushSaid() {
+    var t = saidBuf.trim();
+    saidBuf = "";
+    if (!t) return;
+    clearInterim();
+    addLine("Voice", t, "voice");
+    recent.push({ role: "voice", text: t });
+    if (recent.length > 24) recent.shift();
+    api("/transcript", { role: "voice", text: t }).catch(noop);
+  }
+
+  /* The delegation event carries an id and nothing else: not the question, not the sentence that
+     caused it. The request is what the user said since the last hand-over, and only this page
+     has that. */
+  async function onDelegation(id) {
+    if (!id) return;
+    flushHeard();
+    flushSaid();
+    var said = sinceHandover.splice(0);
+    setStatus("Handing your request to Claude...", said.join(" "));
+    var r, j;
+    try {
+      r = await api("/delegate", { delegation_id: id, said: said, recent: recent.slice(-12) });
+      j = await r.json().catch(function () { return {}; });
+    } catch (e) {
+      commentary(id, "Tell the user Claude could not be reached just now.");
+      return;
+    }
+    if (!r.ok) {
+      commentary(id, "Tell the user: " + (j.error || "I did not catch a request there. Could you say it again?"));
+      return;
+    }
+    lastActivity = Date.now();
+    if (j.attached) {
+      thinking(id, "This is the same request Claude is already handling. Wait for its answer.");
+      return;
+    }
+    if (!j.claudeWaiting && j.ahead > 0) {
+      commentary(id, "Claude is still busy with an earlier request. Tell the user this one is queued and Claude will get to it next" + (j.ahead > 1 ? " (" + j.ahead + " ahead of it)" : "") + ".");
+    } else if (!j.claudeWaiting && j.claude === "away") {
+      commentary(id, "Tell the user: Claude is not listening on the call right now, it may be busy in its own window. The request is saved and Claude will pick it up when it comes back.");
+    }
+  }
+
+  /* ------------------------------------------------------- hanging up -- */
+
+  function hangUp(reason) {
+    if (phase === "ended" || phase === "closing") return;
+    closingReason = reason;
+    clearTimeout(connectTimer);
+    if (phase === "live" && dc && dc.readyState === "open") {
+      /* A Live call is CLOSED, not dropped: session.close, then session.closed carries the final
+         usage, which is what a per-minute model bills on. */
+      phase = "closing";
+      render();
+      setStatus("Hanging up...", reason);
+      liveSend({ type: "session.close" });
+      closeTimer = setTimeout(function () { finish(reason); }, 8000);
+      return;
+    }
+    finish(reason);
+  }
+
+  function teardown() {
+    if (mic) { mic.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} }); mic = null; }
+    if (dc) { try { dc.close(); } catch (e) {} dc = null; }
+    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+    if (audioEl) { try { audioEl.pause(); } catch (e) {} audioEl.srcObject = null; }
+  }
+
+  function finish(reason) {
+    if (phase === "ended") return;
+    clearTimeout(closeTimer);
+    clearTimeout(connectTimer);
+    flushHeard();
+    flushSaid();
+    clearInterim();
+    teardown();
+    hideConfirm();
+    muted = false;
+    var wasLive = Boolean(startedAt);
+    phase = "ended";
+    render();
+    var took = wasLive ? Date.now() - startedAt : 0;
+    setStatus("Call ended.", reason + (wasLive ? " " + mmss(took) + " live, about $" + (took / 60000 * CFG.pricePerMinute).toFixed(2) + "." : "") + " Run /talk-to-claude in Claude to call again.");
+    addLine("Call", "ended: " + reason, "note");
+    api("/state", { state: "closed", reason: reason, usage: usage }, true).catch(noop);
+    if (es) { try { es.close(); } catch (e) {} es = null; }
+  }
+
+  window.addEventListener("pagehide", function () {
+    if (phase === "live" || phase === "connecting" || phase === "closing") {
+      liveSend({ type: "session.close" });
+      api("/state", { state: "closed", reason: "the call page was closed", usage: usage }, true).catch(noop);
+    }
+  });
+
+  /* ---------------------------------------------------------- the clock -- */
+
+  setInterval(function () {
+    var now = Date.now();
+    if (startedAt) {
+      var ms = (phase === "live" || phase === "closing") ? now - startedAt : 0;
+      if (ms) {
+        $("clock").textContent = mmss(ms);
+        $("cost").textContent = "$" + (ms / 60000 * CFG.pricePerMinute).toFixed(2);
+      }
+    }
+    if (phase === "live") {
+      var mins = (now - startedAt) / 60000;
+      if (!warnedMax && mins >= CFG.maxMinutes - 1) {
+        warnedMax = true;
+        instruct("Tell the user, briefly, that the call will end in about a minute because it reached the " + CFG.maxMinutes + "-minute limit.");
+      }
+      if (mins >= CFG.maxMinutes) hangUp("Reached the " + CFG.maxMinutes + "-minute limit.");
+      var busy = claude.claude === "working" || claude.queue > 0;
+      if (!busy && now - lastActivity >= CFG.idleMinutes * 60000) {
+        instruct("Say, in one sentence, that you are hanging up because it has been quiet, and that the user can call again any time.");
+        lastActivity = now;
+        setTimeout(function () { hangUp("Hung up after " + CFG.idleMinutes + " quiet minutes."); }, 6000);
+      }
+      if (sseDownSince && now - sseDownSince > 15000) hangUp("Lost contact with the Claude session (it may have closed).");
+    }
+    if (claude.claude === "working") renderClaude();
+  }, 1000);
+
+  /* ------------------------------------------------------ confirmation -- */
+
+  /* Approval is a click, never a spoken "yes": a yes can come from a television or someone in
+     the room, and the voice paraphrases, so only the exact text on this card is what Claude
+     will run. */
+  var confirmOpen = null, confirmTimer = null;
+
+  function showConfirm(m) {
+    confirmOpen = { id: m.id, until: Date.now() + (m.seconds || 110) * 1000 };
+    $("confirmWhy").textContent = m.why || "Claude wants to do this:";
+    $("confirmAction").textContent = m.action;
+    $("confirmBox").hidden = false;
+    $("confirmBox").scrollIntoView({ block: "center", behavior: "smooth" });
+    addLine("Claude", "asks you to approve: " + m.action, "note");
+    if (phase === "live") setStatus("Claude needs your approval.", "Read the action below, then press Approve or Decline.");
+    commentary(null, "Tell the user, briefly: " + (m.why || "Claude wants to do something that needs approval")
+      + ". They approve or decline it with the buttons on the call page. A spoken yes does not approve it.");
+    clearInterval(confirmTimer);
+    confirmTimer = setInterval(function () {
+      if (!confirmOpen) return;
+      var left = confirmOpen.until - Date.now();
+      $("confirmClock").textContent = left > 0 ? Math.ceil(left / 1000) + "s left, then it counts as declined" : "";
+    }, 500);
+  }
+
+  function hideConfirm() {
+    confirmOpen = null;
+    clearInterval(confirmTimer);
+    $("confirmBox").hidden = true;
+  }
+
+  async function answerConfirm(yes) {
+    if (!confirmOpen) return;
+    var id = confirmOpen.id;
+    hideConfirm();
+    addLine("You", yes ? "approved it" : "declined it", "you");
+    lastActivity = Date.now();
+    try {
+      var r = await api("/confirm", { id: id, approved: yes });
+      if (!r.ok) addLine("Error", "That approval had already closed.", "err");
+    } catch (e) {
+      addLine("Error", "Could not send your answer: " + String((e && e.message) || e), "err");
+    }
+  }
+
+  /* -------------------------------------------------------------- mute -- */
+
+  var muted = false;
+
+  function setMute(on) {
+    muted = on;
+    // Both: the local track stops capturing, and the session is told not to listen.
+    if (mic) mic.getAudioTracks().forEach(function (t) { t.enabled = !on; });
+    liveSend({ type: on ? "session.input_audio.mute" : "session.input_audio.unmute", event_id: "m" + Date.now() + "_" + (++seq) });
+    $("mute").textContent = on ? "Unmute" : "Mute";
+    $("mute").setAttribute("aria-pressed", on ? "true" : "false");
+    setStatus(on ? "Muted." : "Listening.", on ? "The voice cannot hear you. Press Unmute to talk again." : "Talk whenever you are ready.");
+    api("/mute", { muted: on }).catch(noop);
+  }
+
+  /* ------------------------------------------------------------ wiring -- */
+
+  $("go").addEventListener("click", function () { start(); });
+  $("mute").addEventListener("click", function () { if (phase === "live") setMute(!muted); });
+  $("approve").addEventListener("click", function () { answerConfirm(true); });
+  $("decline").addEventListener("click", function () { answerConfirm(false); });
+  $("changeKey").addEventListener("click", function () { showKey(); });
+
+  $("keyForm").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var v = $("key").value.trim();
+    if (!v) return;
+    $("keyMsg").textContent = "Checking the key with OpenAI...";
+    try {
+      var r = await api("/key", { key: v });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok) { $("keyMsg").textContent = j.error || "That key did not work."; return; }
+      $("key").value = "";
+      CFG.keyPresent = true;
+      CFG.keySource = "saved on this computer";
+      CFG.keyHint = j.keyHint;
+      $("keyMsg").textContent = "Saved (" + j.keyHint + "). You can press Start talking now.";
+      render();
+      if (phase === "idle") setStatus("Key saved.", "Press Start talking.");
+      setTimeout(function () { $("keyBox").hidden = true; }, 2500);
+    } catch (err) {
+      $("keyMsg").textContent = "Could not save the key: " + String((err && err.message) || err);
+    }
+  });
+
+  $("typeForm").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var t = $("typed").value.trim();
+    if (!t || phase === "ended") return;
+    $("typed").value = "";
+    addLine("You (typed)", t, "you");
+    try {
+      var r = await api("/typed", { text: t });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok) { addLine("Error", j.error || "Claude did not get that.", "err"); return; }
+      // Nothing delegated it, so its answer reaches the voice as commentary with no delegation id.
+      lastActivity = Date.now();
+    } catch (err) {
+      addLine("Error", "Claude did not get that: " + String((err && err.message) || err), "err");
+    }
+  });
+
+  render();
+  connectEvents();
+  if (CFG.state === "ended") {
+    phase = "ended";
+    render();
+    setStatus("This call has ended.", (CFG.endReason || "") + " Run /talk-to-claude in Claude to call again.");
+  } else if (!CFG.keyPresent) {
+    showKey();
+    setStatus("Add your OpenAI key, then press Start talking.", "One time only. It stays on this computer.");
+  } else {
+    setStatus("Ready.", "Press Start talking, then just talk. Claude does the work in its window while you talk.");
+  }
+})();
+</script>
+</body>
+</html>

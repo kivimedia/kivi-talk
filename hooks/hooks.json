@@ -1,0 +1,42 @@
+{
+  "description": "talk-to-claude: approve only its own call tools, keep the voice loop alive while a call is open, and say permission prompts out loud",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_talk-to-claude_voice__call_.*",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" allow \"${CLAUDE_PLUGIN_DATA}\"" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_talk-to-claude_voice__call_next",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" classify \"${CLAUDE_PLUGIN_DATA}\"" }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_talk-to-claude_voice__call_start",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" bind \"${CLAUDE_PLUGIN_DATA}\"" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" stop \"${CLAUDE_PLUGIN_DATA}\"" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" notify \"${CLAUDE_PLUGIN_DATA}\"" }
+        ]
+      }
+    ]
+  }
+}

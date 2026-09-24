@@ -1,0 +1,12 @@
+{
+  "name": "kivimedia",
+  "owner": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
+  "description": "Kivi Media plugins for Claude Code.",
+  "plugins": [
+    {
+      "name": "talk-to-claude",
+      "source": "./",
+      "description": "Talk out loud to the Claude Code session you are in (voice by OpenAI gpt-live-1, your own key)."
+    }
+  ]
+}
