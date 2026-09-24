@@ -27,8 +27,17 @@ def say(*a):
     print(f"[+{time.time() - T0:5.1f}s]", *a, flush=True)
 
 
+# A throwaway config dir: onboarding already done and this folder already trusted, so the TUI
+# goes straight to the prompt, and none of the machine owner's CLAUDE.md or settings load.
+# Auth comes from CLAUDE_CODE_OAUTH_TOKEN (or whatever wrapper provides it).
+CONFIG = os.path.join(WORK, ".claude-config")
+os.makedirs(CONFIG, exist_ok=True)
+json.dump({"hasCompletedOnboarding": True, "theme": "dark", "lastOnboardingVersion": "9.9.9",
+           "projects": {WORK: {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}}},
+          open(os.path.join(CONFIG, ".claude.json"), "w"))
 env = dict(os.environ,
            TTC_NO_BROWSER="1", TTC_URL_FILE=URL_FILE, TTC_DATA_DIR=DATA, TTC_KEEP_TRANSCRIPTS="1",
+           CLAUDE_CONFIG_DIR=os.environ.get("WAKE_CONFIG_DIR", CONFIG),
            CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=os.environ.get("BG_MS", "15000"), TERM="xterm-256color")
 args = ["claude", "--plugin-dir", PLUGIN, "--permission-mode", "acceptEdits",
         "--allowedTools", "Glob", "Read", "Grep", "Bash(ls:*)", "Bash(find:*)", "Bash(wc:*)"]
@@ -102,8 +111,9 @@ say("call_next pending:", status().get("nextPending"))
 pump(bg_s + 20)
 st = status()
 say(f"after {bg_s + 20:.0f}s more: nextPending={st.get('nextPending')} claude={st.get('claude')}")
-backgrounded = "background" in plain().lower()
-say("screen mentions background:", backgrounded)
+# The TUI shows a backgrounded MCP call as "1 MCP task" (and later "MCP task <id> ... completed").
+backgrounded = bool(re.search(r"MCP\s*task", plain()))
+say("call_next moved to a background MCP task:", backgrounded)
 
 # The user speaks while Claude is idle with call_next in the background.
 post("typed", {"text": "How many markdown files are in this folder?"})
@@ -132,7 +142,10 @@ except OSError:
     pass
 tail = plain()[-3000:]
 open(os.path.join(WORK, "screen.txt"), "w").write(plain())
-result = {"backgrounded": backgrounded, "woke_and_answered": bool(answer), "answer": answer, "work": WORK}
+woke = bool(re.search(r"MCP\s*task\s*\w+\s*\(plugin:talk-to-claude:voice/call_next\)\s*completed", plain()))
+result = {"backgrounded": backgrounded, "woke_from_background": woke, "answered": bool(answer), "answer": answer, "work": WORK}
 print(json.dumps(result, indent=2))
-shutil.rmtree(DATA, ignore_errors=True) if answer else None
-sys.exit(0 if answer else 1)
+ok = backgrounded and woke and bool(answer)
+if ok:
+    shutil.rmtree(DATA, ignore_errors=True)
+sys.exit(0 if ok else 1)

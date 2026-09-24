@@ -21,7 +21,13 @@ When the plugin is enabled, Claude Code asks for your **OpenAI API key** (masked
 system's secure storage). Skip it and the call page asks for it the first time instead.
 
 Requires Node.js 20 or later on your PATH, and a desktop browser with a microphone
-(Chrome, Edge, Firefox or Safari).
+(Chrome, Edge, Firefox or Safari). The repository is private for now: installing uses your own
+git credentials, so you need read access to `kivimedia/talk-to-claude`.
+
+Works wherever Claude Code runs on your own computer: the terminal, the VS Code extension and the
+Code tab of the Claude desktop app. The browser and Claude Code must be on the same machine (the
+call page lives on `127.0.0.1`), so remote SSH sessions, WSL-without-a-Windows-browser and
+cloud sandboxes are not supported.
 
 ## Use
 
