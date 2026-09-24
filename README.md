@@ -81,9 +81,16 @@ cloud sandboxes are not supported.
 ## Privacy and safety
 
 Read [SECURITY.md](SECURITY.md). In short: your voice and whatever Claude says out loud go to
-OpenAI; your files and Claude's work stay on your computer. Claude asks for a spoken "yes" before
-anything destructive or outward-facing, and your normal Claude Code permission rules still apply.
-When a tool needs approval, you hear a heads-up and approve it on screen.
+OpenAI; your files and Claude's work stay on your computer. Before anything destructive or
+outward-facing, Claude shows the exact action on the call page and waits for you to click
+**Approve**; a spoken "yes" is not enough, because anyone near the microphone could say it. Your
+normal Claude Code permission rules still apply on top. When a tool needs approval, you hear a
+heads-up and approve it on screen.
+
+## Releasing
+
+Installed copies update only when `version` in `.claude-plugin/plugin.json` changes. Bump it (and
+`package.json`, and `VERSION` in `server/bridge.mjs`) with every change meant to reach users.
 
 ## Develop
 

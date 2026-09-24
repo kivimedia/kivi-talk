@@ -29,9 +29,10 @@ parties, check before using it on that code.
 ## Voice-specific risks
 
 - **Anyone the microphone hears can speak to Claude.** A person in the room, or audio playing
-  from a video, can issue requests. Claude reads back and waits for a spoken "yes" before
-  anything destructive or outward-facing, and your Claude Code permission rules still apply.
-  Use headphones and hang up when you are done.
+  from a video, can issue requests. Before anything destructive or outward-facing, Claude shows
+  the exact action on the call page and waits for a click on Approve; a spoken "yes" never counts,
+  and nothing is done if nobody clicks within about two minutes. Your Claude Code permission rules
+  still apply on top. Use headphones and hang up when you are done.
 - **Speech recognition can mishear.** Claude is told to ask when a request is ambiguous.
 - **Content Claude reads is not you.** Instructions found inside files, web pages or tool output
   are treated as data. Only requests that arrive through the call are yours.

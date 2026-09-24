@@ -3,7 +3,11 @@
     "voice": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/server/bridge.mjs"],
-      "env": { "TTC_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}" },
+      "env": {
+        "TTC_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
+        "TTC_OPTION_OPENAI_API_KEY": "${user_config.openai_api_key}",
+        "TTC_OPTION_KEEP_TRANSCRIPTS": "${user_config.keep_transcripts}"
+      },
       "timeout": 1800000
     }
   }

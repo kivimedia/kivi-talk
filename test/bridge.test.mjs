@@ -4,7 +4,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { startBridge, mockOpenAI, post, sleep } from "./helpers.mjs";
-import { speakable, redactSecrets, fitSpoken, estimateTokens } from "../server/bridge.mjs";
+import { speakable, redactSecrets, fitSpoken, estimateTokens, peerUidFromTable } from "../server/bridge.mjs";
 
 const KEY = "sk-test-" + "x".repeat(40) + "WXYZ";
 
@@ -545,6 +545,19 @@ test("spoken answers stay under the 500-token append limit in any script", () =>
   const hebrew = "זו תשובה ארוכה מאוד על הקבצים בתיקייה. ".repeat(40);
   assert.ok(estimateTokens(fitSpoken(hebrew)) <= 400);
   assert.equal(fitSpoken("Short and sweet."), "Short and sweet.");
+});
+
+test("peer-account check reads the kernel's socket table correctly", () => {
+  // Server listening on 127.0.0.1:40000 (0x9C40), a client on port 51234 (0xC822) owned by uid 1001.
+  const table = [
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+    "   0: 0100007F:9C40 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111",
+    "   1: 0100007F:9C40 0100007F:C822 01 00000000:00000000 00:00000000 00000000  1000        0 112",
+    "   2: 0100007F:C822 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1001        0 113",
+  ].join("\n");
+  assert.deepEqual(peerUidFromTable(table, 51234, 40000), { sawListener: true, uid: 1001 });
+  assert.deepEqual(peerUidFromTable(table, 50000, 40000), { sawListener: true, uid: null }, "unknown client is not guessed");
+  assert.equal(peerUidFromTable("header only", 51234, 40000).sawListener, false);
 });
 
 test("speakable strips what should not be read aloud", () => {

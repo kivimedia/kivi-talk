@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -56,7 +56,8 @@ const BRIDGES_DIR = path.join(DATA_DIR, "bridges");
 /* Transcripts on disk are opt-in: the call already reaches Claude's own session, and keeping a
    second copy of everything said is exactly the "extraneous data" a plugin should not collect by
    default. The in-memory transcript is always there for the end-of-call summary. */
-const KEEP_TRANSCRIPTS = /^(1|true|yes|on)$/i.test(String(ENV.TTC_KEEP_TRANSCRIPTS || ENV.CLAUDE_PLUGIN_OPTION_KEEP_TRANSCRIPTS || "").trim());
+const KEEP_TRANSCRIPTS = /^(1|true|yes|on)$/i.test(String(ENV.TTC_KEEP_TRANSCRIPTS || ENV.TTC_OPTION_KEEP_TRANSCRIPTS
+  || ENV.CLAUDE_PLUGIN_OPTION_KEEP_TRANSCRIPTS || "").trim());
 const CONFIRM_WAIT_S = num(ENV.TTC_CONFIRM_SECONDS, 110);
 
 function realDir(s) {
@@ -101,8 +102,11 @@ function realKey(s) {
 export function resolveKey() {
   const saved = realKey(readConfig().openai_api_key);
   if (saved) return { key: saved, source: "saved on this computer" };
-  // The plugin's userConfig option arrives as CLAUDE_PLUGIN_OPTION_<KEY>; TTC_ is for tests.
-  const opt = realKey(ENV.CLAUDE_PLUGIN_OPTION_OPENAI_API_KEY) || realKey(ENV.TTC_OPENAI_API_KEY);
+  /* The plugin setting reaches an MCP server ONLY through ${user_config.*} substitution in
+     .mcp.json (TTC_OPTION_*): Claude Code exports CLAUDE_PLUGIN_OPTION_* to hook processes, not
+     to MCP servers. TTC_OPENAI_API_KEY is for tests and manual runs. */
+  const opt = realKey(ENV.TTC_OPTION_OPENAI_API_KEY) || realKey(ENV.CLAUDE_PLUGIN_OPTION_OPENAI_API_KEY)
+    || realKey(ENV.TTC_OPENAI_API_KEY);
   if (opt) return { key: opt, source: "plugin setting" };
   const env = realKey(ENV.OPENAI_API_KEY);
   if (env) return { key: env, source: "OPENAI_API_KEY environment variable" };
@@ -115,7 +119,7 @@ function keyHint(k) {
 
 /* ---------------------------------------------------------------- state -- */
 
-let server = null;
+
 let port = 0;
 let call = null;              // the one call this session can have at a time
 
@@ -424,6 +428,36 @@ function readBody(req) {
   });
 }
 
+/* On Linux, loopback is shared by every account on the machine, and another account can read the
+   launch link out of a browser's argv in /proc and race to redeem it. The kernel records which
+   account owns each end of every TCP connection, so the bridge simply refuses connections that
+   are not from the account running it. (Windows and macOS do not show other users' argv.)
+   Parsed from /proc/net/tcp{,6}: fields are sl, local, remote, st, ..., uid (index 7). */
+export function peerUidFromTable(text, clientPort, serverPort) {
+  const hex = (n) => ":" + Number(n).toString(16).toUpperCase().padStart(4, "0");
+  let sawListener = false, uid = null;
+  for (const line of String(text).split("\n").slice(1)) {
+    const p = line.trim().split(/\s+/);
+    if (p.length < 8) continue;
+    if (p[1].endsWith(hex(serverPort)) && p[3] === "0A") sawListener = true;
+    if (p[1].endsWith(hex(clientPort)) && p[2].endsWith(hex(serverPort))) uid = Number(p[7]);
+  }
+  return { sawListener, uid };
+}
+
+function peerIsMe(req) {
+  if (process.platform !== "linux" || typeof process.getuid !== "function") return true;
+  const sock = req.socket;
+  if (sock.ttcPeerOk !== undefined) return sock.ttcPeerOk;
+  let text = "";
+  for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) { try { text += fs.readFileSync(f, "utf8"); } catch {} }
+  const { sawListener, uid } = peerUidFromTable(text, sock.remotePort, sock.localPort);
+  // A table that does not even show our own listener (some sandboxes, WSL1) cannot be judged.
+  sock.ttcPeerOk = !sawListener ? true : uid === process.getuid();
+  if (!sock.ttcPeerOk) log(`refused a connection from another account (uid ${uid})`);
+  return sock.ttcPeerOk;
+}
+
 function readCookie(req, name) {
   for (const part of String(req.headers.cookie || "").split(";")) {
     const i = part.indexOf("=");
@@ -454,6 +488,7 @@ function sendNote(res, status, title, body) {
  * There are no CORS headers anywhere, and every POST must be application/json, which a
  * cross-site form cannot send without a preflight this server never answers. */
 export async function handle(req, res) {
+  if (!peerIsMe(req)) return sendJson(res, 403, { error: "this call belongs to another account on this computer" });
   const host = String(req.headers.host || "").toLowerCase();
   if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return sendJson(res, 421, { error: "wrong host" });
   const origin = req.headers.origin;
@@ -639,7 +674,7 @@ async function postKey(res, body) {
   cfg.openai_api_key = key;
   writeConfig(cfg);
   log(`OpenAI key saved (${keyHint(key)}) to ${CONFIG_FILE}`);
-  const overrides = Boolean(realKey(ENV.CLAUDE_PLUGIN_OPTION_OPENAI_API_KEY));
+  const overrides = Boolean(realKey(ENV.TTC_OPTION_OPENAI_API_KEY) || realKey(ENV.CLAUDE_PLUGIN_OPTION_OPENAI_API_KEY));
   return sendJson(res, 200, { ok: true, keyHint: keyHint(key), configFile: CONFIG_FILE,
     note: overrides ? "This key is used instead of the one in the plugin settings." : "" });
 }
@@ -809,7 +844,7 @@ function ensureServer() {
       s.keepAliveTimeout = 5000;
       s.once("error", (e) => { listening = null; reject(e); });
       s.listen(Number(ENV.TTC_PORT || 0), "127.0.0.1", () => {
-        server = s;
+
         port = s.address().port;
         s.unref();
         log(`bridge listening on 127.0.0.1:${port}`);

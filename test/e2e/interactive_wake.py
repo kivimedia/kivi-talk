@@ -39,7 +39,10 @@ env = dict(os.environ,
            TTC_NO_BROWSER="1", TTC_URL_FILE=URL_FILE, TTC_DATA_DIR=DATA, TTC_KEEP_TRANSCRIPTS="1",
            CLAUDE_CONFIG_DIR=os.environ.get("WAKE_CONFIG_DIR", CONFIG),
            CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=os.environ.get("BG_MS", "15000"), TERM="xterm-256color")
-args = ["claude", "--plugin-dir", PLUGIN, "--permission-mode", "acceptEdits",
+# AUTO=1: auto permission mode, where the classifier never sees tool results, so a write asked
+# for by voice has to get through on the plugin's classifierContext note (or on its own merits).
+AUTO = os.environ.get("AUTO") == "1"
+args = ["claude", "--plugin-dir", PLUGIN, "--permission-mode", "auto" if AUTO else "acceptEdits",
         "--allowedTools", "Glob", "Read", "Grep", "Bash(ls:*)", "Bash(find:*)", "Bash(wc:*)"]
 pid, fd = pty.fork()
 if pid == 0:
@@ -132,6 +135,25 @@ for _ in range(150):
         break
 say("answer:", answer)
 
+wrote = None
+if AUTO and answer:
+    # Second request, again only after call_next has gone back to the background.
+    for _ in range(int(bg_s) + 60):
+        pump(1)
+        if status().get("nextPending"):
+            break
+    pump(bg_s + 20)
+    post("typed", {"text": "Create a file named hello.txt in this folder containing the word hi."})
+    say("sent the write request (auto mode, call_next backgrounded)")
+    target = os.path.join(WORK, "hello.txt")
+    for _ in range(150):
+        pump(1)
+        if os.path.exists(target):
+            wrote = open(target).read().strip()
+            break
+    say("hello.txt:", repr(wrote))
+    pump(10)
+
 post("state", {"state": "closed", "reason": "test finished"})
 pump(40)
 send("/exit\r")
@@ -143,9 +165,11 @@ except OSError:
 tail = plain()[-3000:]
 open(os.path.join(WORK, "screen.txt"), "w").write(plain())
 woke = bool(re.search(r"MCP\s*task\s*\w+\s*\(plugin:talk-to-claude:voice/call_next\)\s*completed", plain()))
-result = {"backgrounded": backgrounded, "woke_from_background": woke, "answered": bool(answer), "answer": answer, "work": WORK}
+denied = bool(re.search(r"denied|not allowed|blocked", plain(), re.I))
+result = {"auto": AUTO, "backgrounded": backgrounded, "woke_from_background": woke, "answered": bool(answer),
+          "answer": answer, "auto_write": wrote, "screen_mentions_denied": denied, "work": WORK}
 print(json.dumps(result, indent=2))
-ok = backgrounded and woke and bool(answer)
+ok = backgrounded and woke and bool(answer) and (not AUTO or bool(wrote))
 if ok:
     shutil.rmtree(DATA, ignore_errors=True)
 sys.exit(0 if ok else 1)

@@ -20,7 +20,9 @@ import path from "node:path";
 
 const mode = process.argv[2] || "";
 const dataArg = String(process.argv[3] || "").trim();
-const DATA_DIR = (dataArg && !dataArg.includes("${") ? dataArg : "")
+// Same order as the bridge, so both always agree on where the handover files are.
+const DATA_DIR = (process.env.TTC_DATA_DIR || "").trim()
+  || (dataArg && !dataArg.includes("${") ? dataArg : "")
   || (process.env.CLAUDE_PLUGIN_DATA || "").trim()
   || path.join(os.homedir(), ".talk-to-claude");
 const SESSIONS = path.join(DATA_DIR, "sessions");

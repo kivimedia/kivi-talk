@@ -191,6 +191,9 @@ if (card) {
   await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
   await page.screenshot({ path: path.join(RUN, "3-approval-phone.png"), fullPage: true });
   await page.setViewport({ width: 1280, height: 900, deviceScaleFactor: 2 });
+  // Approve arms 900 ms after a card appears (a card that swapped in under the pointer must not
+  // take a click meant for the one before it), so wait for it like a person would.
+  await page.waitForSelector("#approve:not([disabled])", { timeout: 5000 });
   await page.click("#approve");
   say("pressed Approve");
 }

@@ -1,6 +1,6 @@
 {
   "name": "talk-to-claude",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Talk out loud to the Claude Code session you are in. OpenAI gpt-live-1 is the voice (your own OpenAI key); your session does the work with its own tools while you talk.",
   "author": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
   "repository": "https://github.com/kivimedia/talk-to-claude",
