@@ -578,6 +578,7 @@ function statusObj(c) {
     nextPending: Boolean(c.waiter),
     lastLoopAt: c.lastLoopAt,
     keySource: k.source,
+    keepTranscripts: KEEP_TRANSCRIPTS,
     ...claudeStatus(c),
     inFlight: [...c.inFlight.values()].map((r) => ({ id: r.id, text: r.text })),
     queued: c.queue.map((r) => ({ id: r.id, text: r.text })),
