@@ -3,7 +3,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__plugin_talk-to-claude_voice__call_.*",
+        "matcher": "^mcp__plugin_talk-to-claude_voice__call_(start|next|say|confirm|end|status)$",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" allow \"${CLAUDE_PLUGIN_DATA}\"" }
         ]

@@ -25,11 +25,18 @@ async function boundCall(sid = "s") {
   return { b, page: await b.open() };
 }
 
-test("allow approves the call tools", async () => {
+test("allow approves exactly the six call tools and nothing that merely contains their names", async () => {
   const r = await runHook("allow", tmpDir("g"), { session_id: "s1", tool_name: "mcp__plugin_talk-to-claude_voice__call_next" });
   assert.equal(r.code, 0);
   assert.equal(r.json.hookSpecificOutput.permissionDecision, "allow");
   assert.equal(r.json.hookSpecificOutput.hookEventName, "PreToolUse");
+  for (const name of ["mcp__evil__mcp__plugin_talk-to-claude_voice__call_next", "mcp__plugin_talk-to-claude_voice__call_nextx", "Bash", ""]) {
+    assert.equal((await runHook("allow", tmpDir("g"), { tool_name: name })).out, "", `${name || "(empty)"} must not be approved`);
+  }
+  const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, "hooks", "hooks.json"), "utf8"));
+  const matcher = new RegExp(hooks.hooks.PreToolUse[0].matcher);
+  assert.ok(matcher.test("mcp__plugin_talk-to-claude_voice__call_confirm"));
+  assert.ok(!matcher.test("mcp__evil__mcp__plugin_talk-to-claude_voice__call_next"), "the matcher is anchored");
 });
 
 test("classify tells auto mode the request was the user's own speech, and passes only the request line", async () => {
@@ -93,6 +100,9 @@ test("stop: the loop guard gives up after three blocks with no progress", async 
   try {
     for (let i = 0; i < 3; i++) assert.equal((await runHook("stop", b.data, { session_id: "s" })).json.decision, "block");
     assert.equal((await runHook("stop", b.data, { session_id: "s" })).out, "", "fourth stop with no call_next in between is allowed");
+    assert.equal((await runHook("stop", b.data, { session_id: "s" })).out, "");
+    const notices = fs.readFileSync(path.join(b.data, "calls", fs.readdirSync(path.join(b.data, "calls"))[0]), "utf8").match(/stopped listening/g) || [];
+    assert.equal(notices.length, 1, "the give-up notice is spoken once, not on every later stop");
   } finally { b.stop(); }
 });
 

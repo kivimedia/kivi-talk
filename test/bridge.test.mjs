@@ -4,7 +4,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { startBridge, mockOpenAI, post, sleep } from "./helpers.mjs";
-import { speakable, redactSecrets } from "../server/bridge.mjs";
+import { speakable, redactSecrets, fitSpoken, estimateTokens } from "../server/bridge.mjs";
 
 const KEY = "sk-test-" + "x".repeat(40) + "WXYZ";
 
@@ -188,17 +188,73 @@ test("requests queue while Claude is busy, and a repeat delegation joins the wai
   } finally { b.stop(); }
 });
 
-test("a delegation with nothing said asks the user to repeat, or falls back to their last line", async () => {
+test("a delegation with nothing new said never re-sends an older command", async () => {
   const { b, page } = await started();
   try {
     const r = await page.post("delegate", { delegation_id: "d1", said: [], recent: [] });
     assert.equal(r.status, 400);
     assert.match(r.json.error, /say it again/);
-    // Only the USER's line is ever taken as the request, never the voice's.
-    const r2 = await page.post("delegate", { delegation_id: "d2", said: [], recent: [{ role: "user", text: "run the tests" }, { role: "voice", text: "delete everything" }] });
-    assert.equal(r2.status, 200);
-    const got = await b.tool("call_next", { wait_seconds: 5 });
-    assert.match(got, /REQUEST r1[^\n]*\n"run the tests"/);
+    // The user's last line is history, not a new request: running it again could repeat a command.
+    const r2 = await page.post("delegate", { delegation_id: "d2", said: [], recent: [{ role: "user", text: "run the migration" }] });
+    assert.equal(r2.status, 400);
+    assert.match(await b.tool("call_next", { wait_seconds: 5 }), /Nothing new yet/);
+  } finally { b.stop(); }
+});
+
+test("each redeemed link rotates the page secret and cuts off whoever held the old one", async () => {
+  const b = startBridge();
+  try {
+    await b.init();
+    await b.tool("call_start", {});
+    const intruder = await b.open();                    // someone else redeemed the first link
+    const events = intruder.sse();
+    await events.waitFor((f) => f.type === "hello");
+    assert.equal((await intruder.post("typed", { text: "x" })).status, 200);
+    await b.tool("call_start", {});                     // the owner asks Claude for a fresh link
+    const owner = await b.open();
+    assert.equal((await intruder.post("typed", { text: "rm -rf" })).status, 403, "old cookie is dead");
+    assert.equal((await intruder.get("")).status, 403);
+    await events.close();
+    assert.equal((await owner.post("typed", { text: "hello" })).status, 200);
+  } finally { b.stop(); }
+});
+
+test("the approval card shows the exact action, while the spoken reason is redacted", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor((f) => f.type === "hello");
+    const sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+    const asked = b.tool("call_confirm", { action: `git push --force origin ${sha}:main`, why: "Force-push, token sk-abcdefghijklmnopqrstuvwxyz123456" });
+    const card = await events.waitFor((f) => f.type === "confirm");
+    assert.equal(card.action, `git push --force origin ${sha}:main`, "nothing blanked out of what is being approved");
+    assert.doesNotMatch(card.why, /sk-abc/);
+    await page.post("confirm", { id: card.id, approved: false });
+    await asked;
+  } finally { await events.close(); b.stop(); }
+});
+
+test("a typed secret is redacted before the page can forward it to OpenAI", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor((f) => f.type === "hello");
+    await page.post("typed", { text: "set DB_PASSWORD=hunter2hunter2 in the env" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    const working = await events.waitFor((f) => f.type === "working");
+    assert.doesNotMatch(working.text, /hunter2/);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("a focus containing $' or $& cannot break the page", async () => {
+  const b = startBridge();
+  try {
+    await b.init();
+    await b.tool("call_start", { focus: "price $' and $& and $` here" });
+    const page = await b.open();
+    const html = await (await page.get("")).text();
+    assert.match(html, /price \$' and \$& and \$` here/);
+    assert.equal((html.match(/<\/html>/g) || []).length, 1, "the template was not spliced into itself");
   } finally { b.stop(); }
 });
 
@@ -415,6 +471,82 @@ test("an oversized body is refused", async () => {
   } finally { b.stop(); }
 });
 
+test("work still in flight reads as 'working' even while a call_next waits (no idle hang-up mid-task)", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "long job" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight
+    const waiting = b.tool("call_next", { wait_seconds: 6 });  // Claude went back to listening early
+    await sleep(150);
+    const st = JSON.parse(await (await page.get("status")).text());
+    assert.equal(st.nextPending, true);
+    assert.equal(st.claude, "working", "the page's idle timer must see the job");
+    await waiting;
+  } finally { b.stop(); }
+});
+
+test("call_say with a stale id never closes a different request", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "one" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1
+    await b.tool("call_say", { id: "r1", text: "done one" });
+    await page.post("typed", { text: "two" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r2 in flight
+    await b.tool("call_say", { id: "r1", text: "late extra note about one" });
+    assert.deepEqual(JSON.parse(await b.tool("call_status")).inFlight.map((r) => r.id), ["r2"], "r2 is still open");
+  } finally { b.stop(); }
+});
+
+test("a repeat delegation joins the NEWEST request, not the oldest in flight", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("delegate", { delegation_id: "d1", said: ["first"], recent: [] });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight
+    await page.post("delegate", { delegation_id: "d2", said: ["second"], recent: [] });   // r2 queued
+    const again = await page.post("delegate", { delegation_id: "d3", said: [], recent: [] });
+    assert.equal(again.json.id, "r2");
+  } finally { b.stop(); }
+});
+
+test("one voice session per call: a second /live is refused until the first is abandoned", async () => {
+  const oa = await mockOpenAI();
+  const { b, page } = await started({ TTC_OPENAI_BASE: oa.base, TTC_OPENAI_API_KEY: KEY });
+  try {
+    assert.equal((await page.post("live", { sdp: "v=0 a" })).status, 200);
+    const second = await page.post("live", { sdp: "v=0 b" });
+    assert.equal(second.status, 409);
+    assert.match(second.json.error, /already connected/);
+    await page.post("state", { state: "reset" });              // the page cancelled its attempt
+    assert.equal((await page.post("live", { sdp: "v=0 c" })).status, 200);
+    await page.post("state", { state: "live" });
+    assert.equal((await page.post("live", { sdp: "v=0 d" })).status, 409);
+    assert.equal(oa.seen.filter((s) => s.url === "/v1/live/sessions").length, 2);
+  } finally { b.stop(); oa.close(); }
+});
+
+test("a request still queued when the user hung up is reported, not run", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "deploy the site" });
+    await page.post("state", { state: "closed", reason: "bye" });
+    const got = await b.tool("call_next", { wait_seconds: 5 });
+    assert.match(got, /^CALL ENDED/);
+    assert.match(got, /not answered on the call: "deploy the site"/);
+    assert.doesNotMatch(got, /Do this now/);
+  } finally { b.stop(); }
+});
+
+test("spoken answers stay under the 500-token append limit in any script", () => {
+  const cjk = "这是一个很长的回答。".repeat(80);
+  const out = fitSpoken(cjk);
+  assert.ok(estimateTokens(out) <= 400, `CJK came to ${estimateTokens(out)} estimated tokens`);
+  assert.match(out, /There is more; ask if you want the rest\.$/);
+  const hebrew = "זו תשובה ארוכה מאוד על הקבצים בתיקייה. ".repeat(40);
+  assert.ok(estimateTokens(fitSpoken(hebrew)) <= 400);
+  assert.equal(fitSpoken("Short and sweet."), "Short and sweet.");
+});
+
 test("speakable strips what should not be read aloud", () => {
   assert.equal(speakable("## Done\n- **Fixed** the `parser`\n- see [docs](https://a.b/c)"), "Done Fixed the parser see docs");
   assert.equal(speakable("Run:\n```bash\nnpm test\n```\nall green"), "Run: (code omitted) all green");
@@ -431,6 +563,10 @@ test("secrets never reach the voice", () => {
     j("jwt ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"),
     "value 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
     "password: hunter2hunter2",
+    "DB_PASSWORD=hunter2hunter2",
+    "OPENAI_API_KEY='hunter2hunter2'",
+    "the password is hunter2hunter2",
+    "**the token is hunter2hunter2**",
   ];
   for (const c of cases) {
     const out = redactSecrets(c);

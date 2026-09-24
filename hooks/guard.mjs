@@ -98,6 +98,10 @@ async function main() {
   const sid = input.session_id;
 
   if (mode === "allow") {
+    /* The matcher is the first gate; this is the second. Only these exact six tools, so a tool
+       from some other MCP server whose name merely CONTAINS ours is never approved here. */
+    const OURS = /^mcp__plugin_talk-to-claude_voice__call_(start|next|say|confirm|end|status)$/;
+    if (!OURS.test(String(input.tool_name || ""))) return;
     out({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -157,7 +161,10 @@ async function main() {
     /* A loop guard. If Claude has been sent back three times and has not touched the call
        since, something is wrong that another block will not fix: let it stop, and say so. */
     if (st.lastLoopAt && st.lastLoopAt === b.lastLoopAt && b.blocks >= 3) {
-      try { await postJson(br, "/notify", { text: "Claude stopped listening on the call. Type in its window, or say goodbye and call again." }); } catch {}
+      if (!b.gaveUp) {   // said once, not on every later stop
+        writeBinding(sid, { ...b, gaveUp: true });
+        try { await postJson(br, "/notify", { text: "Claude stopped listening on the call. Type in its window, or say goodbye and call again." }); } catch {}
+      }
       return;
     }
     writeBinding(sid, { ...b, blocks: st.lastLoopAt === b.lastLoopAt ? (b.blocks || 0) + 1 : 1, lastLoopAt: st.lastLoopAt || 0 });

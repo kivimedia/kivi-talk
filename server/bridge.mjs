@@ -3,8 +3,8 @@
  *
  * One process per Claude Code session, started by the plugin's .mcp.json.
  *   - stdio: a small MCP server (newline-delimited JSON-RPC 2.0) with the call_* tools.
- *   - http:  127.0.0.1 on a random port, serving the call page and its API, all of it under
- *            /c/<token>/ where the token is 192 random bits minted per call.
+ *   - http:  127.0.0.1 on a random port, serving the call page and its API under /c/<call id>/,
+ *            behind a cookie the browser only gets by redeeming a one-time launch link.
  *
  * The session that started this process IS the brain. OpenAI gpt-live-1 is only the ear and
  * the mouth: when it wants work done it emits session.delegation.created, the page posts the
@@ -95,12 +95,15 @@ function realKey(s) {
   return v && !v.includes("${") ? v : "";
 }
 
+/* A key pasted on the call page wins over the plugin setting: it is the newest thing the user
+   did about keys, and it was checked with OpenAI before it was saved. Otherwise a rejected
+   plugin-setting key could never be replaced from the page that reports the rejection. */
 export function resolveKey() {
+  const saved = realKey(readConfig().openai_api_key);
+  if (saved) return { key: saved, source: "saved on this computer" };
   // The plugin's userConfig option arrives as CLAUDE_PLUGIN_OPTION_<KEY>; TTC_ is for tests.
   const opt = realKey(ENV.CLAUDE_PLUGIN_OPTION_OPENAI_API_KEY) || realKey(ENV.TTC_OPENAI_API_KEY);
   if (opt) return { key: opt, source: "plugin setting" };
-  const saved = realKey(readConfig().openai_api_key);
-  if (saved) return { key: saved, source: "saved on this computer" };
   const env = realKey(ENV.OPENAI_API_KEY);
   if (env) return { key: env, source: "OPENAI_API_KEY environment variable" };
   return { key: "", source: "none" };
@@ -180,14 +183,17 @@ function remember(c, role, text) {
       fs.mkdirSync(dir, { recursive: true });
       c.logFile = path.join(dir, `${line.at.slice(0, 10)}-${c.id}.jsonl`);
     }
-    fs.appendFileSync(c.logFile, JSON.stringify(line) + "\n");
+    fs.appendFileSync(c.logFile, JSON.stringify(line) + "\n", { mode: 0o600 });
   } catch (e) { /* a transcript that cannot be written must not break the call */ }
 }
 
 function claudeStatus(c) {
+  /* Unanswered work wins over a waiting call_next: Claude can be listening for the next request
+     while the last one still runs in the background, and reporting "listening" then would let the
+     page hang up for quiet in the middle of the work. */
   const working = [...c.inFlight.values()].at(-1);
+  if (working) return { claude: "working", on: redactSecrets(working.text), queue: c.queue.length };
   if (c.waiter) return { claude: "listening", queue: c.queue.length };
-  if (working) return { claude: "working", on: working.text, queue: c.queue.length };
   if (Date.now() - c.lastLoopAt < 15000) return { claude: "listening", queue: c.queue.length };
   return { claude: "away", queue: c.queue.length };
 }
@@ -251,7 +257,8 @@ function enqueue(c, text, recent, delegationId, source) {
 function deliver(c, r) {
   c.inFlight.set(r.id, r);
   c.lastLoopAt = Date.now();
-  push({ type: "working", id: r.id, text: r.text, delegationIds: r.delegationIds });
+  // The page forwards this to OpenAI as quiet context, so a typed secret must not ride along.
+  push({ type: "working", id: r.id, text: redactSecrets(r.text), delegationIds: r.delegationIds });
   pushStatus();
   const convo = r.recent
     .map((l) => `${l.role === "user" ? "User" : "Voice"}: ${String(l.text || "").slice(0, 600)}`)
@@ -296,13 +303,20 @@ const SECRET_PATTERNS = [
 export function redactSecrets(s) {
   let out = String(s || "");
   for (const re of SECRET_PATTERNS) out = out.replace(re, " [secret removed] ");
-  return out.replace(/\b(password|passwd|secret|token|api[_ -]?key)(\s*[:=]\s*)\S+/gi, "$1$2[removed]");
+  // NAME=value and NAME: value, including .env names like DB_PASSWORD or OPENAI_API_KEY.
+  out = out.replace(/\b([A-Za-z0-9_]*(?:password|passwd|passcode|secret|token|api[_ -]?key|private[_ -]?key)[A-Za-z0-9_]*)(\s*[:=]\s*)["']?[^\s"']+["']?/gi, "$1$2[removed]");
+  // "the password is hunter2" / "my token was abc123".
+  return out.replace(/\b(password|passcode|secret|token|api key|private key)(\s+(?:is|was|=)\s+)["']?[^\s"',.;]+/gi, "$1$2[removed]");
 }
 
 /* Commentary is heard, not read. A star read aloud is the word star, a code block is noise,
    and a URL is thirty seconds of letters. */
 export function speakable(s) {
-  return redactSecrets(s)
+  return redactSecrets(stripMarkdown(redactSecrets(s))).replace(/\s+/g, " ").trim();
+}
+
+function stripMarkdown(s) {
+  return String(s)
     .replace(/```[\s\S]*?```/g, " (code omitted) ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
@@ -315,14 +329,42 @@ export function speakable(s) {
     .trim();
 }
 
+/* The limit is 500 TOKENS, so count roughly in tokens, not characters: Chinese, Japanese and
+   Korean run about one token per character, Hebrew, Arabic, Cyrillic and the like two or three
+   characters a token, Latin text about four. Deliberately pessimistic. */
+export function estimateTokens(s) {
+  let t = 0;
+  for (const ch of String(s)) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0x3040 && c <= 0x30ff) || (c >= 0x3400 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xf900 && c <= 0xfaff)) t += 1.3;
+    else if (c > 0x2ff) t += 0.5;
+    else t += 0.3;
+  }
+  return Math.ceil(t);
+}
+
 /* Cut at the last sentence that fits, and say that there is more, rather than stopping the
-   voice mid-word. */
+   voice mid-word (or having OpenAI refuse the whole append and saying nothing at all). */
 const MORE = " There is more; ask if you want the rest.";
-export function fitSpoken(s, max = SAY_MAX) {
-  if (s.length <= max) return s;
-  const room = s.slice(0, max - MORE.length);
-  const end = Math.max(room.lastIndexOf(". "), room.lastIndexOf("! "), room.lastIndexOf("? "), room.lastIndexOf("׃ "));
-  return (end > max / 3 ? room.slice(0, end + 1) : room.replace(/\s+\S*$/, "") + ".") + MORE;
+const SAY_TOKENS = 380;   // 500 minus the page's framing line, with room to spare
+export function fitSpoken(s, maxTokens = SAY_TOKENS) {
+  s = String(s).slice(0, SAY_MAX * 4);
+  if (s.length <= SAY_MAX && estimateTokens(s) <= maxTokens) return s;
+  const budget = maxTokens - estimateTokens(MORE);
+  const parts = s.match(/[^.!?。！？׃]+[.!?。！？׃]*\s*/g) || [s];
+  let out = "";
+  for (const p of parts) {
+    if (out.length + p.length > SAY_MAX - MORE.length || estimateTokens(out + p) > budget) break;
+    out += p;
+  }
+  if (!out) {   // one enormous sentence: cut at a word
+    for (const ch of s) {
+      if (out.length + 1 > SAY_MAX - MORE.length || estimateTokens(out + ch) > budget) break;
+      out += ch;
+    }
+    out = out.replace(/\s+\S*$/, "") + ".";
+  }
+  return out.trim() + MORE;
 }
 
 /* ------------------------------------------------------ voice briefing -- */
@@ -426,7 +468,16 @@ export async function handle(req, res) {
     const c = call;
     const already = c && tokenOk(readCookie(req, `ttc_${c.id}`), c.secret);
     if (c && isOpen(c) && (already || (c.launch && tokenOk(launch[1], c.launch)))) {
-      if (!already) c.launch = null;   // spent: the code in history, argv and the transcript is dead now
+      if (!already) {
+        /* Spent: the code in history, argv and the transcript is dead now. And the page secret
+           ROTATES, closing every page that held the old one: whoever redeemed the previous link
+           (another OS user can read a browser's argv on macOS and Linux) loses the call the
+           moment its owner asks Claude for a fresh link and opens it. Newest opener owns it. */
+        c.launch = null;
+        c.secret = crypto.randomBytes(32).toString("base64url");
+        for (const res of c.sse) { try { res.end(); } catch {} }
+        c.sse.clear();
+      }
       res.writeHead(302, {
         ...SECURITY_HEADERS,
         "set-cookie": `ttc_${c.id}=${c.secret}; HttpOnly; SameSite=Strict; Path=/c/${c.id}/`,
@@ -514,7 +565,9 @@ function servePage(res, c) {
   if (!pageTemplate) pageTemplate = fs.readFileSync(path.join(HERE, "call.html"), "utf8");
   const nonce = crypto.randomBytes(16).toString("base64");
   const cfg = JSON.stringify(pageConfig(c)).replace(/</g, "\\u003c");
-  const html = pageTemplate.replaceAll("__NONCE__", nonce).replace("__CONFIG__", cfg);
+  // Replacer functions, not strings: a "$'" in the focus or a folder name would otherwise be
+  // read as a replacement pattern and splice the rest of the template into the page.
+  const html = pageTemplate.replaceAll("__NONCE__", () => nonce).replace("__CONFIG__", () => cfg);
   res.writeHead(200, {
     ...SECURITY_HEADERS,
     "content-type": "text/html; charset=utf-8",
@@ -544,6 +597,7 @@ function serveEvents(req, res, c) {
   res.write("retry: 2000\n\n");
   res.write(`data: ${JSON.stringify({ type: "hello", ...pageConfig(c) })}\n\n`);
   c.sse.add(res);
+  if (c.goneTimer) { clearTimeout(c.goneTimer); c.timers.delete(c.goneTimer); c.goneTimer = null; }
   for (const m of c.outbox.splice(0)) res.write(`data: ${JSON.stringify(m)}\n\n`);
   const ka = setInterval(() => { try { res.write(": ka\n\n"); } catch {} }, 15000);
   req.on("close", () => {
@@ -553,7 +607,10 @@ function serveEvents(req, res, c) {
        (tab closed, browser quit) the call is over, and call_next must say so rather than wait
        for a voice that no longer exists. A short blip reconnects inside the grace window. */
     if (!c.sse.size && (c.state === "connecting" || c.state === "live")) {
-      later(c, PAGE_GONE_MS, () => {
+      // One timer, restarted by each loss and cleared by each reconnect, so two short blips
+      // never add up to a hang-up.
+      clearTimeout(c.goneTimer);
+      c.goneTimer = later(c, PAGE_GONE_MS, () => {
         if (call === c && !c.sse.size && isOpen(c)) endCall("the call page was closed");
       });
     }
@@ -582,11 +639,19 @@ async function postKey(res, body) {
   cfg.openai_api_key = key;
   writeConfig(cfg);
   log(`OpenAI key saved (${keyHint(key)}) to ${CONFIG_FILE}`);
-  return sendJson(res, 200, { ok: true, keyHint: keyHint(key), configFile: CONFIG_FILE });
+  const overrides = Boolean(realKey(ENV.CLAUDE_PLUGIN_OPTION_OPENAI_API_KEY));
+  return sendJson(res, 200, { ok: true, keyHint: keyHint(key), configFile: CONFIG_FILE,
+    note: overrides ? "This key is used instead of the one in the plugin settings." : "" });
 }
 
 async function postLive(res, c, body) {
   if (!isOpen(c)) return sendJson(res, 409, { error: "This call has ended. Start a new one from Claude with /talk-to-claude." });
+  /* One voice session per call. A second tab (or a double click) opening another would bill
+     twice and hand every request to Claude twice. A connect attempt older than the page's own
+     20-second timeout is dead and may be replaced. */
+  if (c.liveId && (c.state === "live" || (c.state === "connecting" && Date.now() - (c.liveTriedAt || 0) < 25000))) {
+    return sendJson(res, 409, { error: "This call is already connected in another tab or window. Use that one, or end it first." });
+  }
   const { key, source } = resolveKey();
   if (!key) return sendJson(res, 400, { error: "No OpenAI key yet.", needKey: true });
   const sdp = String(body.sdp || "");
@@ -622,6 +687,7 @@ async function postLive(res, c, body) {
     });
   }
   c.liveId = (j.session && j.session.id) || null;
+  c.liveTriedAt = Date.now();
   if (c.state === "created") c.state = "connecting";
   remember(c, "system", `voice session ${c.liveId || "?"} opened on ${MODEL}`);
   pushStatus();
@@ -645,12 +711,12 @@ function postState(res, c, body) {
     endCall(String(body.reason || "hung up on the call page").slice(0, 200), body.usage || null);
     return sendJson(res, 200, { ok: true });
   }
-  return sendJson(res, 400, { error: "state must be live or closed" });
-}
-
-function lastUserLine(recent) {
-  const l = [...(recent || [])].reverse().find((x) => x && x.role === "user" && String(x.text || "").trim());
-  return l ? String(l.text).trim() : "";
+  if (s === "reset") {
+    // The page gave up on a connect attempt (cancelled, or it failed): the call itself goes on.
+    if (c.state === "connecting") { c.state = "created"; c.liveId = null; remember(c, "system", "connect attempt abandoned"); pushStatus(); }
+    return sendJson(res, 200, { ok: true });
+  }
+  return sendJson(res, 400, { error: "state must be live, closed or reset" });
 }
 
 function postDelegate(res, c, body) {
@@ -661,17 +727,19 @@ function postDelegate(res, c, body) {
   const textSaid = said.join(" ").trim();
 
   /* The delegation event carries an id and nothing else, so the request is whatever the user
-     said since the last hand-over. When nothing new was said (the voice delegated twice for
-     one sentence), the id joins the request already waiting instead of inventing a new one. */
+     said since the last hand-over. When nothing new was said, the only safe readings are "the
+     voice delegated twice for the sentence it just handed over" (join that request, if it is
+     seconds old) or "nothing to do". Re-sending an older line would run a finished command a
+     second time. */
   if (!textSaid) {
-    const pending = [...c.queue, ...c.inFlight.values()].at(-1);
-    if (pending && id) {
+    const pending = [...c.queue, ...c.inFlight.values()].sort((a, b) => a.at - b.at).at(-1);   // the newest
+    if (pending && id && Date.now() - pending.at < 20000) {
       pending.delegationIds.push(id);
       return sendJson(res, 200, { id: pending.id, attached: true, ...ackFor(c, pending) });
     }
+    return sendJson(res, 400, { error: "I did not catch a request there. Could you say it again?" });
   }
-  const t = textSaid || lastUserLine(recent);
-  if (!t) return sendJson(res, 400, { error: "I did not catch a request there. Could you say it again?" });
+  const t = textSaid;
   const { r, ahead, claudeWaiting } = enqueue(c, t, recent, id, "voice");
   return sendJson(res, 200, { id: r.id, ahead, claudeWaiting, claude: claudeStatus(c).claude });
 }
@@ -726,22 +794,30 @@ function postNotify(res, c, body) {
   return sendJson(res, 200, { ok: true });
 }
 
-async function ensureServer() {
-  if (server) return;
-  server = http.createServer((req, res) => {
-    handle(req, res).catch((e) => {
-      log("http error: " + (e && e.stack || e));
-      try { sendJson(res, 500, { error: "internal error" }); } catch {}
+/* One promise, shared: two call_starts racing both wait for the same listen, and a failed
+   listen is forgotten so the next call_start tries again instead of handing out port 0. */
+let listening = null;
+function ensureServer() {
+  if (!listening) {
+    listening = new Promise((resolve, reject) => {
+      const s = http.createServer((req, res) => {
+        handle(req, res).catch((e) => {
+          log("http error: " + (e && e.stack || e));
+          try { sendJson(res, 500, { error: "internal error" }); } catch {}
+        });
+      });
+      s.keepAliveTimeout = 5000;
+      s.once("error", (e) => { listening = null; reject(e); });
+      s.listen(Number(ENV.TTC_PORT || 0), "127.0.0.1", () => {
+        server = s;
+        port = s.address().port;
+        s.unref();
+        log(`bridge listening on 127.0.0.1:${port}`);
+        resolve();
+      });
     });
-  });
-  server.keepAliveTimeout = 5000;
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(Number(ENV.TTC_PORT || 0), "127.0.0.1", () => resolve());
-  });
-  port = server.address().port;
-  server.unref();
-  log(`bridge listening on 127.0.0.1:${port}`);
+  }
+  return listening;
 }
 
 /* ------------------------------------------------------------- browser -- */
@@ -754,7 +830,12 @@ function openBrowser(url) {
     else if (process.platform === "darwin") { cmd = "open"; args = [url]; }
     else if (ENV.WSL_DISTRO_NAME) { cmd = "cmd.exe"; args = ["/c", "start", "", url]; }
     else { cmd = "xdg-open"; args = [url]; }
-    const p = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
+    // The browser gets no copy of the key: strip anything that could carry it.
+    const env = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (/^CLAUDE_PLUGIN_OPTION_|OPENAI|^TTC_/i.test(k)) delete env[k];
+    }
+    const p = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true, env });
     p.on("error", () => {});
     p.unref();
     return true;
@@ -787,7 +868,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        wait_seconds: { type: "number", description: `How long to wait before returning 'nothing yet' (default ${NEXT_WAIT_DEFAULT}, max 3600).` },
+        wait_seconds: { type: "number", description: `How long to wait before returning 'nothing yet' (default ${NEXT_WAIT_DEFAULT}, max 1500).` },
       },
     },
   },
@@ -879,7 +960,10 @@ async function toolCall(name, args, ctx) {
         resolve(text(`DECLINED: no answer on the call page within ${CONFIRM_WAIT_S} seconds. Do not do it. Tell the user briefly with call_say.`));
       }, CONFIRM_WAIT_S * 1000);
       c.confirms.set(id, { action, why, resolve: (s) => { clearTimeout(timer); resolve(text(s)); } });
-      push({ type: "confirm", id, action: redactSecrets(action), why, seconds: CONFIRM_WAIT_S });
+      /* The card shows the action EXACTLY, unredacted: it is drawn on this computer only (never
+         sent to OpenAI; only `why` is spoken), and an approval of a line with parts blanked
+         out is an approval of something the user could not read. */
+      push({ type: "confirm", id, action, why, seconds: CONFIRM_WAIT_S });
     });
   }
 
@@ -887,9 +971,11 @@ async function toolCall(name, args, ctx) {
     if (!call) return fail("No call is open. Call call_start first.");
     const c = call;
     c.lastLoopAt = Date.now();
-    if (c.queue.length) return deliver(c, c.queue.shift());
+    // Ended first: a request still queued when the user hung up is reported, not run.
     if (!isOpen(c)) return endedResult(c);
-    const wait = Math.min(Math.max(Number(args.wait_seconds) || NEXT_WAIT_DEFAULT, 5), 3600);
+    if (c.queue.length) return deliver(c, c.queue.shift());
+    // Under the plugin's 30-minute per-call timeout (.mcp.json), which progress does not extend.
+    const wait = Math.min(Math.max(Number(args.wait_seconds) || NEXT_WAIT_DEFAULT, 5), 1500);
     if (c.waiter) { const old = c.waiter; c.waiter = null; old.resolve(text("Superseded: a newer call_next is waiting now. Ignore this result.")); }
     return await new Promise((resolve) => {
       let beat = null;
@@ -923,7 +1009,9 @@ async function toolCall(name, args, ctx) {
     const said = fitSpoken(speakable(args.text));
     if (!said) return fail("Nothing to say: text was empty after removing markdown.");
     const final = args.final !== false;
-    const r = (args.id && c.inFlight.get(String(args.id))) || [...c.inFlight.values()].at(-1) || null;
+    /* An explicit id that is no longer in flight (already answered, or never existed) must not
+       fall through to closing some OTHER request: it goes out as a plain note. */
+    const r = args.id ? (c.inFlight.get(String(args.id)) || null) : ([...c.inFlight.values()].at(-1) || null);
     const delivered = push({ type: "say", id: r ? r.id : null, text: said, final, delegationIds: r ? r.delegationIds : [] });
     remember(c, "claude", (final ? "" : "(progress) ") + said);
     if (final && r) c.inFlight.delete(r.id);

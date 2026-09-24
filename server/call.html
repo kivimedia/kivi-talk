@@ -266,10 +266,9 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     if (m.type === "say") { onSay(m); return; }
     if (m.type === "confirm") { showConfirm(m); return; }
     if (m.type === "confirm_done") {
-      if (confirmOpen && confirmOpen.id === m.id) {
-        hideConfirm();
-        if (m.expired) addLine("Call", "the approval request timed out, so Claude will not do it", "note");
-      }
+      confirmQueue = confirmQueue.filter(function (q) { return q.id !== m.id; });
+      if (m.expired) addLine("Call", "an approval request timed out, so Claude will not do it", "note");
+      if (confirmOpen && confirmOpen.id === m.id) hideConfirm();
       return;
     }
     if (m.type === "notify") {
@@ -354,8 +353,25 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     });
   }
 
+  /* Cancel is not hang up. While connecting, the button abandons this attempt and the call stays
+     open for another try; only End call (phase live) ends it. A double click would otherwise
+     start a connection and then cancel it, or worse, end the call. */
+  var lastGoClick = 0;
+  function cancelConnect() {
+    clearTimeout(connectTimer);
+    teardown();
+    phase = "idle";
+    render();
+    api("/state", { state: "reset" }).catch(noop);
+    setStatus("Cancelled.", "Nothing is connected. Press Start talking to try again.");
+  }
+
   async function start() {
-    if (phase === "live" || phase === "connecting") { hangUp("You ended the call."); return; }
+    var now = Date.now();
+    if (now - lastGoClick < 700) return;
+    lastGoClick = now;
+    if (phase === "live") { hangUp("You ended the call."); return; }
+    if (phase === "connecting") { cancelConnect(); return; }
     if (phase !== "idle") return;
     if (!CFG.keyPresent) { showKey(); setStatus("Add your OpenAI key to start.", "It is used only to open the voice session."); return; }
     phase = "connecting";
@@ -398,11 +414,13 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       await pc.setRemoteDescription({ type: "answer", sdp: j.sdp });
       setStatus("Connecting audio...", "Waiting for OpenAI to start the session.");
       connectTimer = setTimeout(function () {
-        if (phase === "connecting") hangUp("The voice session did not start within 20 seconds.");
+        if (phase !== "connecting") return;
+        cancelConnect();
+        setStatus("Could not start the call.", "The voice session did not start within 20 seconds. Press Start talking to try again.");
       }, 20000);
     } catch (e) {
       teardown();
-      if (phase === "connecting") phase = "idle";
+      if (phase === "connecting") { phase = "idle"; api("/state", { state: "reset" }).catch(noop); }
       render();
       var msg = String((e && e.message) || e);
       if (e && e.name === "NotAllowedError") msg = "The browser blocked the microphone. Allow it for this page and press Start again.";
@@ -428,7 +446,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     if (t === "session.input_transcript.delta") {
       if (saidBuf.trim()) flushSaid();
       heardBuf += ev.delta || "";
-      lastActivity = Date.now();
+      lastActivity = lastHeardAt = Date.now();
       showInterim("You", heardBuf);
       settle("heard", flushHeard, 2000);
       return;
@@ -467,7 +485,9 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     settleTimers[key] = setTimeout(fn, ms);
   }
 
-  var HANGUP =/^\s*(?:(?:ok(?:ay)?|thanks?|thank you|great|perfect)[,.!]?\s*)*(?:please\s+)?(?:hang up|end (?:the|this) call|bye(?:[- ]bye)?|good ?bye)(?:\s+(?:claude|now|for now))?[\s.!]*$/i;
+  /* The whole utterance has to be a goodbye ("Bye, Claude.", "OK, hang up please.", "Thanks,
+     goodbye!"), so "don't hang up yet" or "say bye to the old API" never end the call. */
+  var HANGUP = /^\s*(?:(?:ok(?:ay)?|thanks?|thank you|great|perfect|all ?right|alright|cool)[,.!]?\s*)*(?:please[,]?\s+)?(?:hang up|end (?:the|this) call|bye(?:[- ]bye)?|good ?bye)(?:[,.!]?\s*(?:claude|now|for now|please|thanks|thank you|then))*[\s.!]*$/i;
 
   function flushHeard() {
     var t = heardBuf.trim();
@@ -481,7 +501,9 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     api("/transcript", { role: "user", text: t }).catch(noop);
     if (HANGUP.test(t) && phase === "live") {
       instruct("The user is ending the call. Say a short goodbye, nothing else.");
-      setTimeout(function () { hangUp("You said goodbye."); }, 4500);
+      var saidByeAt = Date.now();
+      // "Bye... actually wait" keeps the call: only hang up if they stayed quiet after it.
+      setTimeout(function () { if (lastHeardAt <= saidByeAt) hangUp("You said goodbye."); }, 4500);
     }
   }
 
@@ -499,8 +521,23 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   /* The delegation event carries an id and nothing else: not the question, not the sentence that
      caused it. The request is what the user said since the last hand-over, and only this page
      has that. */
+  /* Live can decide to delegate before the user has finished the sentence. Handing over at that
+     instant would send "delete the file called" and leave "note seven" for nobody, so wait until
+     the user has been quiet for a second (at most five) before taking what they said. */
+  var lastHeardAt = 0;
+  function userQuiet(ms, max) {
+    var t0 = Date.now();
+    return new Promise(function (resolve) {
+      (function check() {
+        if (Date.now() - lastHeardAt >= ms || Date.now() - t0 >= max) return resolve();
+        setTimeout(check, 120);
+      })();
+    });
+  }
+
   async function onDelegation(id) {
     if (!id) return;
+    await userQuiet(1000, 5000);
     flushHeard();
     flushSaid();
     var said = sinceHandover.splice(0);
@@ -511,10 +548,12 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       j = await r.json().catch(function () { return {}; });
     } catch (e) {
       commentary(id, "Tell the user Claude could not be reached just now.");
+      setStatus("Listening.", "That request did not reach Claude (the Claude session may have closed).");
       return;
     }
     if (!r.ok) {
       commentary(id, "Tell the user: " + (j.error || "I did not catch a request there. Could you say it again?"));
+      setStatus("Listening.", j.error || "No request was handed over.");
       return;
     }
     lastActivity = Date.now();
@@ -563,7 +602,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     flushSaid();
     clearInterim();
     teardown();
-    hideConfirm();
+    hideConfirm(true);
     muted = false;
     var wasLive = Boolean(startedAt);
     phase = "ended";
@@ -604,7 +643,11 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       if (!busy && now - lastActivity >= CFG.idleMinutes * 60000) {
         instruct("Say, in one sentence, that you are hanging up because it has been quiet, and that the user can call again any time.");
         lastActivity = now;
-        setTimeout(function () { hangUp("Hung up after " + CFG.idleMinutes + " quiet minutes."); }, 6000);
+        var warnedAt = now;
+        setTimeout(function () {
+          // They spoke up after the warning: the call is not idle any more.
+          if (lastHeardAt <= warnedAt) hangUp("Hung up after " + CFG.idleMinutes + " quiet minutes.");
+        }, 6000);
       }
       if (sseDownSince && now - sseDownSince > 15000) hangUp("Lost contact with the Claude session (it may have closed).");
     }
@@ -616,10 +659,15 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   /* Approval is a click, never a spoken "yes": a yes can come from a television or someone in
      the room, and the voice paraphrases, so only the exact text on this card is what Claude
      will run. */
-  var confirmOpen = null, confirmTimer = null;
+  var confirmOpen = null, confirmTimer = null, confirmQueue = [];
 
+  /* One card at a time, and Approve is dead for a moment after a card appears: a card that
+     swapped in under the pointer must never collect a click meant for the one before it. */
   function showConfirm(m) {
+    if (confirmOpen) { confirmQueue.push(m); return; }
     confirmOpen = { id: m.id, until: Date.now() + (m.seconds || 110) * 1000 };
+    $("approve").disabled = true;
+    setTimeout(function () { if (confirmOpen && confirmOpen.id === m.id) $("approve").disabled = false; }, 900);
     $("confirmWhy").textContent = m.why || "Claude wants to do this:";
     $("confirmAction").textContent = m.action;
     $("confirmBox").hidden = false;
@@ -636,10 +684,15 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     }, 500);
   }
 
-  function hideConfirm() {
+  function hideConfirm(dropQueue) {
     confirmOpen = null;
     clearInterval(confirmTimer);
     $("confirmBox").hidden = true;
+    if (dropQueue) { confirmQueue = []; return; }
+    if (confirmQueue.length) {
+      var next = confirmQueue.shift();
+      setTimeout(function () { showConfirm(next); }, 300);
+    }
   }
 
   async function answerConfirm(yes) {
@@ -648,9 +701,13 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     hideConfirm();
     addLine("You", yes ? "approved it" : "declined it", "you");
     lastActivity = Date.now();
+    if (phase === "live") setStatus(yes ? "Approved." : "Declined.", yes ? "Claude is doing it now." : "Claude will not do it.");
     try {
       var r = await api("/confirm", { id: id, approved: yes });
-      if (!r.ok) addLine("Error", "That approval had already closed.", "err");
+      if (!r.ok) {
+        addLine("Error", "That approval had already closed.", "err");
+        if (phase === "live") setStatus("That approval had already closed.", "It timed out or the call moved on; Claude did not get your answer.");
+      }
     } catch (e) {
       addLine("Error", "Could not send your answer: " + String((e && e.message) || e), "err");
     }
@@ -692,7 +749,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       CFG.keyPresent = true;
       CFG.keySource = "saved on this computer";
       CFG.keyHint = j.keyHint;
-      $("keyMsg").textContent = "Saved (" + j.keyHint + "). You can press Start talking now.";
+      $("keyMsg").textContent = "Saved (" + j.keyHint + "). " + (j.note ? j.note + " " : "") + "You can press Start talking now.";
       render();
       if (phase === "idle") setStatus("Key saved.", "Press Start talking.");
       setTimeout(function () { $("keyBox").hidden = true; }, 2500);
