@@ -30,7 +30,7 @@ test("MCP handshake lists exactly the six call tools", async () => {
   const b = startBridge();
   try {
     const init = await b.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
-    assert.equal(init.result.serverInfo.name, "talk-to-claude");
+    assert.equal(init.result.serverInfo.name, "kivi-talk");
     assert.equal(init.result.protocolVersion, "2025-06-18");
     const list = await b.rpc("tools/list", {});
     assert.deepEqual(list.result.tools.map((t) => t.name).sort(),

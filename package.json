@@ -1,8 +1,9 @@
 {
-  "name": "talk-to-claude",
-  "version": "0.2.0",
+  "name": "kivi-talk",
+  "version": "0.3.0",
   "private": true,
-  "description": "Claude Code plugin: talk out loud to your Claude session (voice by OpenAI gpt-live-1, your own key).",
+  "license": "Apache-2.0",
+  "description": "Kivi Talk: talk out loud to your Claude Code session (voice powered by OpenAI GPT-Live, your own key).",
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {

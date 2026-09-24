@@ -4,9 +4,9 @@
   "description": "Kivi Media plugins for Claude Code.",
   "plugins": [
     {
-      "name": "talk-to-claude",
+      "name": "kivi-talk",
       "source": "./",
-      "description": "Talk out loud to the Claude Code session you are in (voice by OpenAI gpt-live-1, your own key)."
+      "description": "Kivi Talk: talk out loud to the Claude Code session you are in (voice powered by OpenAI GPT-Live, your own key). Type /talk."
     }
   ]
 }

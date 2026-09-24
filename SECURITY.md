@@ -1,6 +1,6 @@
 # Security and privacy
 
-talk-to-claude lets a voice drive a Claude Code session that can read and change files and run
+Kivi Talk lets a voice drive a Claude Code session that can read and change files and run
 commands. That is the point of it, and it is also why the defaults below exist.
 
 ## What leaves your computer

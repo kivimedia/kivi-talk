@@ -1,20 +1,22 @@
-# talk-to-claude
+# Kivi Talk
 
-Talk out loud to the Claude Code session you are in.
+Talk out loud to the Claude Code session you are in. Voice for Claude Code, powered by OpenAI
+GPT-Live.
 
-Type `/talk-to-claude`, press **Start talking** on the page that opens, and speak. A voice model
+Type `/talk`, press **Start talking** on the page that opens, and speak. A voice model
 (OpenAI **gpt-live-1**, on your own OpenAI key) listens and talks back. Everything you ask for is
 handed to **your Claude session**, which does the work with its own tools, in its own window,
 under its own permission rules, and answers out loud.
 
-> Not affiliated with, endorsed by, or sponsored by Anthropic or OpenAI. Claude is a trademark of
-> Anthropic. GPT is a trademark of OpenAI.
+> Kivi Talk is an independent project by Kivi Media. It is not affiliated with, endorsed by, or
+> sponsored by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC. GPT is
+> a trademark of OpenAI.
 
 ## Install
 
 ```
-/plugin marketplace add kivimedia/talk-to-claude
-/plugin install talk-to-claude@kivimedia
+/plugin marketplace add kivimedia/kivi-talk
+/plugin install kivi-talk@kivimedia
 ```
 
 When the plugin is enabled, Claude Code asks for your **OpenAI API key** (masked, stored in your
@@ -22,7 +24,7 @@ system's secure storage). Skip it and the call page asks for it the first time i
 
 Requires Node.js 20 or later on your PATH, and a desktop browser with a microphone
 (Chrome, Edge, Firefox or Safari). The repository is private for now: installing uses your own
-git credentials, so you need read access to `kivimedia/talk-to-claude`.
+git credentials, so you need read access to `kivimedia/kivi-talk`.
 
 Works wherever Claude Code runs on your own computer: the terminal, the VS Code extension and the
 Code tab of the Claude desktop app. The browser and Claude Code must be on the same machine (the
@@ -32,8 +34,8 @@ cloud sandboxes are not supported.
 ## Use
 
 ```
-/talk-to-claude                     start a call
-/talk-to-claude the failing tests   start a call about something specific
+/talk                     start a call
+/talk the failing tests   start a call about something specific
 ```
 
 - Talk normally. Ask it to read, run, fix, explain, look things up: anything you would type.
@@ -103,3 +105,8 @@ claude --plugin-dir .                 # try it without installing
 The end-to-end test plays a spoken question into a headless Chrome fake microphone, runs a real
 `claude -p` session with the plugin, and checks that the answer is spoken back. It uses a minute
 or two of gpt-live-1.
+
+## Licence
+
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). The licence does not cover the
+Kivi Talk or Kivi Media names.

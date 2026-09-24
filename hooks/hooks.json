@@ -1,9 +1,9 @@
 {
-  "description": "talk-to-claude: approve only its own call tools, keep the voice loop alive while a call is open, and say permission prompts out loud",
+  "description": "kivi-talk: approve only its own call tools, keep the voice loop alive while a call is open, and say permission prompts out loud",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^mcp__plugin_talk-to-claude_voice__call_(start|next|say|confirm|end|status)$",
+        "matcher": "^mcp__plugin_kivi-talk_voice__call_(start|next|say|confirm|end|status)$",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" allow \"${CLAUDE_PLUGIN_DATA}\"" }
         ]
@@ -11,13 +11,13 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_talk-to-claude_voice__call_next",
+        "matcher": "mcp__plugin_kivi-talk_voice__call_next",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" classify \"${CLAUDE_PLUGIN_DATA}\"" }
         ]
       },
       {
-        "matcher": "mcp__plugin_talk-to-claude_voice__call_start",
+        "matcher": "mcp__plugin_kivi-talk_voice__call_start",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" bind \"${CLAUDE_PLUGIN_DATA}\"" }
         ]

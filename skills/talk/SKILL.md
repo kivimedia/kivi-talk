@@ -1,6 +1,6 @@
 ---
-name: talk-to-claude
-description: Start a voice call with this Claude session. The user talks out loud (OpenAI gpt-live-1 voice, their own key); you do the work here with your normal tools and answer out loud. Only when the user runs /talk-to-claude.
+name: talk
+description: Start a voice call with this Claude session. The user talks out loud (OpenAI gpt-live-1 voice, their own key); you do the work here with your normal tools and answer out loud. Only when the user runs /talk.
 argument-hint: "[what you want to work on]"
 disable-model-invocation: true
 ---

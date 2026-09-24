@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <link rel="icon" href="data:,">
-<title>Talk to Claude</title>
+<title>Kivi Talk</title>
 <style nonce="__NONCE__">
 :root {
   color-scheme: light dark;
@@ -75,7 +75,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
 <body>
 <main>
   <header>
-    <h1>Talk to Claude</h1>
+    <h1>Kivi Talk</h1>
     <span id="project"></span>
   </header>
 
@@ -243,7 +243,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
       if (m.state === "ended") {
         if (phase === "live" || phase === "connecting") hangUp("Claude ended the call.");
-        else if (phase !== "ended") { phase = "ended"; setStatus("This call has ended.", (m.endReason || "") + " Run /talk-to-claude in Claude to call again."); }
+        else if (phase !== "ended") { phase = "ended"; setStatus("This call has ended.", (m.endReason || "") + " Run /talk in Claude to call again."); }
       }
       render();
       return;
@@ -608,7 +608,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     phase = "ended";
     render();
     var took = wasLive ? Date.now() - startedAt : 0;
-    setStatus("Call ended.", reason + (wasLive ? " " + mmss(took) + " live, about $" + (took / 60000 * CFG.pricePerMinute).toFixed(2) + "." : "") + " Run /talk-to-claude in Claude to call again.");
+    setStatus("Call ended.", reason + (wasLive ? " " + mmss(took) + " live, about $" + (took / 60000 * CFG.pricePerMinute).toFixed(2) + "." : "") + " Run /talk in Claude to call again.");
     addLine("Call", "ended: " + reason, "note");
     api("/state", { state: "closed", reason: reason, usage: usage }, true).catch(noop);
     if (es) { try { es.close(); } catch (e) {} es = null; }
@@ -780,7 +780,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   if (CFG.state === "ended") {
     phase = "ended";
     render();
-    setStatus("This call has ended.", (CFG.endReason || "") + " Run /talk-to-claude in Claude to call again.");
+    setStatus("This call has ended.", (CFG.endReason || "") + " Run /talk in Claude to call again.");
   } else if (!CFG.keyPresent) {
     showKey();
     setStatus("Add your OpenAI key, then press Start talking.", "One time only. It stays on this computer.");

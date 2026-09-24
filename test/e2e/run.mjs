@@ -13,7 +13,7 @@
  *   CHROME_PATH         Chrome/Chromium binary (defaults to the usual Windows path)
  *   ASK_WAV             optional: the question as a WAV. On Windows one is synthesised.
  *
- * Usage: node test/e2e/run.mjs [--prompt "/talk-to-claude"]
+ * Usage: node test/e2e/run.mjs [--prompt "/talk"]
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const arg = (name, dflt) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : dflt; };
-const PROMPT = arg("--prompt", "/talk-to-claude");
+const PROMPT = arg("--prompt", "/talk");
 // "default" pre-allows the delete; "auto" leaves it to auto mode's classifier (and our note to it).
 const PERMISSION_MODE = arg("--permission-mode", "default");
 const KEY = (process.env.TTC_E2E_OPENAI_KEY || "").trim();

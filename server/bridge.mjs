@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* talk-to-claude bridge.
+/* kivi-talk bridge.
  *
  * One process per Claude Code session, started by the plugin's .mcp.json.
  *   - stdio: a small MCP server (newline-delimited JSON-RPC 2.0) with the call_* tools.
@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -50,7 +50,7 @@ const SAY_MAX = 900;
 const BODY_MAX = 256 * 1024;   // an SDP offer is a few KB
 // TTC_DATA_DIR is an override (tests); the plugin passes its own data dir as TTC_PLUGIN_DATA.
 const DATA_DIR = realDir(ENV.TTC_DATA_DIR) || realDir(ENV.TTC_PLUGIN_DATA) || realDir(ENV.CLAUDE_PLUGIN_DATA)
-  || path.join(os.homedir(), ".talk-to-claude");
+  || path.join(os.homedir(), ".kivi-talk");
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 const BRIDGES_DIR = path.join(DATA_DIR, "bridges");
 /* Transcripts on disk are opt-in: the call already reaches Claude's own session, and keeping a
@@ -72,7 +72,7 @@ function num(v, dflt) {
 
 function log(...a) {
   // stdout is the MCP wire. Everything human goes to stderr.
-  process.stderr.write("[talk-to-claude] " + a.join(" ") + "\n");
+  process.stderr.write("[kivi-talk] " + a.join(" ") + "\n");
 }
 
 /* ------------------------------------------------------------------ key -- */
@@ -473,7 +473,7 @@ function sendNote(res, status, title, body) {
     "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
   });
   const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
-  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Talk to Claude</title>`
+  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kivi Talk</title>`
     + `<body style="font:17px/1.5 system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color-scheme:light dark">`
     + `<h1 style="font-size:22px">${esc(title)}</h1><p>${esc(body)}</p></body>`);
 }
@@ -681,7 +681,7 @@ async function postKey(res, body) {
 }
 
 async function postLive(res, c, body) {
-  if (!isOpen(c)) return sendJson(res, 409, { error: "This call has ended. Start a new one from Claude with /talk-to-claude." });
+  if (!isOpen(c)) return sendJson(res, 409, { error: "This call has ended. Start a new one from Claude with /talk." });
   /* One voice session per call. A second tab (or a double click) opening another would bill
      twice and hand every request to Claude twice. A connect attempt older than the page's own
      20-second timeout is dead and may be replaced. */
@@ -894,7 +894,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        focus: { type: "string", description: "Optional: what the user wants to work on, from the /talk-to-claude arguments." },
+        focus: { type: "string", description: "Optional: what the user wants to work on, from the /talk arguments." },
       },
     },
   },
@@ -1123,8 +1123,8 @@ export function startMcp(input = process.stdin, output = process.stdout) {
       return reply({
         protocolVersion: (params && params.protocolVersion) || "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "talk-to-claude", version: VERSION },
-        instructions: "Voice calls with the user. /talk-to-claude starts one: call_start, then loop call_next -> work -> call_say until call_next reports the call ended.",
+        serverInfo: { name: "kivi-talk", version: VERSION },
+        instructions: "Voice calls with the user. /talk starts one: call_start, then loop call_next -> work -> call_say until call_next reports the call ended.",
       });
     }
     if (method === "ping") return reply({});

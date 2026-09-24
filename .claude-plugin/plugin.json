@@ -1,15 +1,16 @@
 {
-  "name": "talk-to-claude",
-  "version": "0.2.0",
-  "description": "Talk out loud to the Claude Code session you are in. OpenAI gpt-live-1 is the voice (your own OpenAI key); your session does the work with its own tools while you talk.",
+  "name": "kivi-talk",
+  "version": "0.3.0",
+  "description": "Kivi Talk: talk out loud to the Claude Code session you are in. The voice is powered by OpenAI GPT-Live on your own OpenAI key; your session does the work with its own tools while you talk. Type /talk.",
   "author": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
-  "repository": "https://github.com/kivimedia/talk-to-claude",
-  "keywords": ["voice", "speech", "hands-free", "gpt-live-1", "call"],
+  "repository": "https://github.com/kivimedia/kivi-talk",
+  "license": "Apache-2.0",
+  "keywords": ["voice", "speech", "hands-free", "talk", "call"],
   "userConfig": {
     "openai_api_key": {
       "type": "string",
       "title": "OpenAI API key",
-      "description": "Your own OpenAI API key (starts with sk-). Used only to open gpt-live-1 voice sessions, billed to your OpenAI account, about $0.05 a minute while a call is live. You can leave this empty and paste it on the call page the first time instead.",
+      "description": "Your own OpenAI API key (starts with sk-). Used only to open GPT-Live voice sessions, billed to your OpenAI account, about $0.05 a minute while a call is live. You can leave this empty and paste it on the call page the first time instead.",
       "sensitive": true
     },
     "keep_transcripts": {

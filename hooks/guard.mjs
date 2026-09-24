@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* talk-to-claude hooks, one script, four modes:
+/* kivi-talk hooks, one script, four modes:
  *
  *   allow   PreToolUse on this plugin's own call_* tools: approve them, so a call does not stop
  *           for a permission prompt every time Claude goes back to listening. Nothing else is
@@ -24,7 +24,7 @@ const dataArg = String(process.argv[3] || "").trim();
 const DATA_DIR = (process.env.TTC_DATA_DIR || "").trim()
   || (dataArg && !dataArg.includes("${") ? dataArg : "")
   || (process.env.CLAUDE_PLUGIN_DATA || "").trim()
-  || path.join(os.homedir(), ".talk-to-claude");
+  || path.join(os.homedir(), ".kivi-talk");
 const SESSIONS = path.join(DATA_DIR, "sessions");
 
 function readStdin() {
@@ -102,13 +102,13 @@ async function main() {
   if (mode === "allow") {
     /* The matcher is the first gate; this is the second. Only these exact six tools, so a tool
        from some other MCP server whose name merely CONTAINS ours is never approved here. */
-    const OURS = /^mcp__plugin_talk-to-claude_voice__call_(start|next|say|confirm|end|status)$/;
+    const OURS = /^mcp__plugin_kivi-talk_voice__call_(start|next|say|confirm|end|status)$/;
     if (!OURS.test(String(input.tool_name || ""))) return;
     out({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "allow",
-        permissionDecisionReason: "talk-to-claude call tool (only drives the voice call)",
+        permissionDecisionReason: "kivi-talk call tool (only drives the voice call)",
       },
     });
     return;
@@ -125,7 +125,7 @@ async function main() {
     const said = JSON.parse('"' + m[3] + '"').replace(/\s+/g, " ").slice(0, 600);
     const how = m[2].startsWith("typed")
       ? "typed by the user on the local call page"
-      : "spoken by the user on a voice call they started with /talk-to-claude, transcribed from their microphone (speech recognition, not speaker-verified)";
+      : "spoken by the user on a voice call they started with /talk, transcribed from their microphone (speech recognition, not speaker-verified)";
     out({
       hookSpecificOutput: {
         hookEventName: "PostToolUse",

@@ -75,10 +75,10 @@ if "trust" in plain().lower():
     say("answering the folder-trust prompt")
     send("\r")
     pump(4)
-send("/talk-to-claude")
+send("/talk")
 pump(1.5)
 send("\r")
-say("typed /talk-to-claude")
+say("typed /talk")
 
 for _ in range(120):
     pump(1)
@@ -164,7 +164,7 @@ except OSError:
     pass
 tail = plain()[-3000:]
 open(os.path.join(WORK, "screen.txt"), "w").write(plain())
-woke = bool(re.search(r"MCP\s*task\s*\w+\s*\(plugin:talk-to-claude:voice/call_next\)\s*completed", plain()))
+woke = bool(re.search(r"MCP\s*task\s*\w+\s*\(plugin:kivi-talk:voice/call_next\)\s*completed", plain()))
 denied = bool(re.search(r"denied|not allowed|blocked", plain(), re.I))
 result = {"auto": AUTO, "backgrounded": backgrounded, "woke_from_background": woke, "answered": bool(answer),
           "answer": answer, "auto_write": wrote, "screen_mentions_denied": denied, "work": WORK}
