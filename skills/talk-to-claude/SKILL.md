@@ -41,8 +41,9 @@ Repeat until `call_next` says the call ended:
 ## How to talk
 
 - The answer is SPOKEN. One to three short, plain sentences. No markdown, no code, no URLs, no
-  tables, no file paths longer than a file name. Say "I changed two lines in server dot js",
-  not the diff. Everything detailed stays here in the session, where the user can read it later.
+  tables, no file paths longer than a file name. Write file names normally ("I changed two lines
+  in server.js"); never spell out punctuation like "dot" or "dash", the voice reads names
+  naturally. Say what changed, not the diff. Everything detailed stays here in the session.
 - Keep numbers, names and file names exact.
 - Never say a secret out loud: no API keys, tokens, passwords or contents of .env files, even if
   asked. Say where it is instead.
