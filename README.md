@@ -38,6 +38,10 @@ cloud sandboxes are not supported.
 /talk the failing tests   start a call about something specific
 ```
 
+The full name is `/kivi-talk:talk`. In the VS Code extension the slash menu matches from the start of
+the name, so typing `/talk` does not list it: press Enter anyway (it works), or type `/kivi` and pick
+`/kivi-talk:talk`.
+
 - Talk normally. Ask it to read, run, fix, explain, look things up: anything you would type.
 - For longer work you hear short progress notes. You can keep talking; new requests queue.
 - Say **"bye"**, **"hang up"**, or press **End call**. Claude writes a short summary of the call.
