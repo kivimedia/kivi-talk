@@ -43,8 +43,12 @@ already open? That window keeps its old command list: type `/reload-plugins` in 
 `/talk` appears. Sending `/talk` works even before that.
 
 - Talk normally. Ask it to read, run, fix, explain, look things up: anything you would type.
+  Everything you say goes to Claude, not just what the voice decides to pass on: if the voice
+  answers something itself, the call page hands it to Claude anyway.
 - For longer work you hear short progress notes. You can keep talking; new requests queue.
-- Say **"bye"**, **"hang up"**, or press **End call**. Claude writes a short summary of the call.
+- Say **"bye"**, **"hang up"**, or press **End call**. Claude gets the whole conversation,
+  finishes anything left over in the session (asking you in the chat first before anything
+  destructive or outward-facing), and reports what was done.
 - You can also type a request on the call page, or type in Claude's window as usual.
 
 ## What it costs

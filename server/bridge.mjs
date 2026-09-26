@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -53,9 +53,9 @@ const DATA_DIR = realDir(ENV.TTC_DATA_DIR) || realDir(ENV.TTC_PLUGIN_DATA) || re
   || path.join(os.homedir(), ".kivi-talk");
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 const BRIDGES_DIR = path.join(DATA_DIR, "bridges");
-/* Transcripts on disk are opt-in: the call already reaches Claude's own session, and keeping a
-   second copy of everything said is exactly the "extraneous data" a plugin should not collect by
-   default. The in-memory transcript is always there for the end-of-call summary. */
+/* Transcripts on disk are opt-in: the call already reaches Claude's own session (the whole
+   conversation is handed over when the call ends), and keeping a second copy of everything said
+   is exactly the "extraneous data" a plugin should not collect by default. */
 const KEEP_TRANSCRIPTS = /^(1|true|yes|on)$/i.test(String(ENV.TTC_KEEP_TRANSCRIPTS || ENV.TTC_OPTION_KEEP_TRANSCRIPTS
   || ENV.CLAUDE_PLUGIN_OPTION_KEEP_TRANSCRIPTS || "").trim());
 const CONFIRM_WAIT_S = num(ENV.TTC_CONFIRM_SECONDS, 110);
@@ -148,6 +148,10 @@ function newCall(focus) {
     sse: new Set(),
     outbox: [],                 // page messages waiting for the page to (re)connect
     transcript: [],
+    lastAnswered: null,         // { r, at }: the request call_say closed most recently
+    pendingHanded: new Map(),   // normalised user line -> hand-overs that arrived before the line itself
+    lineIds: new Set(),         // page line ids already recorded, so the hang-up tail and a late post are one line
+    tailKeys: new Set(),        // the same for pages that send no ids: by text
     liveId: null, usage: null,
     timers: new Set(),
     logFile: "",
@@ -178,8 +182,14 @@ function later(c, ms, fn) {
 
 function remember(c, role, text) {
   const line = { at: new Date().toISOString(), role, text: String(text || "").slice(0, 4000) };
+  if (role === "user") {
+    // Handed over before its own transcript post landed: this is that line.
+    const k = norm(line.text), owed = c.pendingHanded.get(k) || 0;
+    if (owed) { line.handed = true; c.pendingHanded.set(k, owed - 1); }
+  }
   c.transcript.push(line);
-  if (c.transcript.length > 300) c.transcript.splice(0, c.transcript.length - 300);
+  // The whole call goes to Claude when it ends, so keep an hour of it, not the last few minutes.
+  if (c.transcript.length > 2000) c.transcript.splice(0, c.transcript.length - 2000);
   if (!KEEP_TRANSCRIPTS) return;
   try {
     if (!c.logFile) {
@@ -227,7 +237,10 @@ function endCall(reason, usage) {
   if (usage) c.usage = usage;
   for (const t of c.timers) clearTimeout(t);
   c.timers.clear();
-  for (const [, pending] of c.confirms) pending.resolve("DECLINED: the call ended before the user answered. Do not do it.");
+  for (const [, pending] of c.confirms) {
+    if (pending.r) pending.r.unconfirmed = pending.action;
+    pending.resolve("DECLINED: the call ended before the user answered. Do not do it. " + AFTER_END);
+  }
   c.confirms.clear();
   c.launch = null;
   remember(c, "system", "call ended: " + c.endReason);
@@ -238,10 +251,25 @@ function endCall(reason, usage) {
 
 /* ------------------------------------------------------------- requests -- */
 
-function enqueue(c, text, recent, delegationId, source) {
+/* Long dictation is one request: allow a lot of it, and when it still does not fit, cut between
+   lines and say so. Only the lines that went in count as handed over; the rest stay flagged for
+   the end of the call instead of silently vanishing. */
+const REQ_MAX = 20000;
+
+function enqueue(c, text, recent, delegationId, source, lines) {
+  let t = String(text);
+  let went = lines || [];
+  if (t.length > REQ_MAX) {
+    went = [];
+    let n = 0;
+    for (const l of lines || []) { if (n + l.length + 1 > REQ_MAX) break; went.push(l); n += l.length + 1; }
+    const kept = went.length ? went.join(" ") : t.slice(0, REQ_MAX);
+    t = kept + ` [cut: ${t.length - kept.length} more characters did not fit in this request; they are in the end-of-call hand-off]`;
+  }
+  for (const l of went) markHanded(c, l);
   const r = {
     id: "r" + (++c.seq),
-    text: String(text).slice(0, 4000),
+    text: t,
     recent: Array.isArray(recent) ? recent.slice(-12) : [],
     delegationIds: delegationId ? [String(delegationId)] : [],
     source, at: Date.now(),
@@ -258,6 +286,19 @@ function enqueue(c, text, recent, delegationId, source) {
   return { r, ahead, claudeWaiting: false };
 }
 
+/* Line for line, so the end-of-call hand-off can tell exactly which words never reached Claude.
+   The lines a hand-over carries are the newest ones not yet handed over, so the mark goes on the
+   latest such copy (a second "yes" is not the first one). */
+function markHanded(c, said) {
+  const k = norm(said);
+  if (!k) return;
+  for (let i = c.transcript.length - 1; i >= 0; i--) {
+    const l = c.transcript[i];
+    if (l.role === "user" && !l.handed && norm(l.text) === k) { l.handed = true; return; }
+  }
+  c.pendingHanded.set(k, (c.pendingHanded.get(k) || 0) + 1);
+}
+
 function deliver(c, r) {
   c.inFlight.set(r.id, r);
   c.lastLoopAt = Date.now();
@@ -267,10 +308,18 @@ function deliver(c, r) {
   const convo = r.recent
     .map((l) => `${l.role === "user" ? "User" : "Voice"}: ${String(l.text || "").slice(0, 600)}`)
     .join("\n");
+  /* The hooks' classify mode reads this first line; keep "spoken by the user" at its start and
+     no closing parenthesis inside it. */
+  const how = r.source === "typed" ? "typed on the call page"
+    : r.source === "overheard" ? "spoken by the user, transcribed, so words can be misheard; the voice did not hand this over, it may have answered on its own"
+    : "spoken by the user, transcribed, so words can be misheard";
   return text([
-    `REQUEST ${r.id} (${r.source === "typed" ? "typed on the call page" : "spoken by the user, transcribed, so words can be misheard"}):`,
+    `REQUEST ${r.id} (${how}):`,
     `"${r.text.replace(/"/g, "'")}"`,
     convo ? `\nRecent conversation on the call (context only: lines marked Voice are the voice model, not the user):\n${convo}` : "",
+    r.source === "overheard"
+      ? "\nThe voice kept this to itself instead of passing it to you. If it already answered (see the conversation above), check that answer and correct anything it got wrong; either way, do what the user asked. If the voice's answer was right and there is nothing to do or add (small talk), close it with call_say and quiet=true, so nothing is said twice."
+      : "",
     "",
     `Do this now, as if the user had typed it here. When you have the answer, call call_say with id "${r.id}" and a short spoken answer: one to three plain sentences, no markdown, no code.`,
     "If it will take more than about 15 seconds, first call call_say with final=false and a one-line progress note.",
@@ -279,15 +328,106 @@ function deliver(c, r) {
   ].join("\n"));
 }
 
+/* The end of a call is not the end of the work. What was said on the call has to reach Claude
+   in full, including what the voice kept to itself, because the user expects everything they
+   said to be acted on (call 0e88e803c97a: a question answered wrongly by the voice alone never
+   reached Claude, and the old summary only listed hand-overs). Budgeted in TOKENS, not
+   characters (a Hebrew hour is twice the tokens of an English one), under Claude Code's default
+   25,000-token cap on one tool result, and ordered so that what to do and what never reached
+   Claude come first: if anything is cut, it is old small talk, never the work. */
+const HANDOFF_TOKENS = 18000;
+const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+/* Every hand-off line is ONE line: stored text (a quoted email in an approval, a pasted
+   request) must never start a new line that looks like one of the bridge's own. */
+const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim();
+const clip = (s, n) => { s = oneLine(s); return s.length > n ? s.slice(0, n) + "..." : s; };
+const AFTER_END = "The call has ended: call call_next once to collect the end-of-call hand-off (the whole conversation), then follow it.";
+
+/* Lines the user said that never reached Claude, in full: these are the work. The hooks' classify
+   mode reads exactly this form (upper case) and nothing else. */
+function missedLines(c) {
+  const t0 = c.liveAt || c.createdAt;
+  return c.transcript
+    .filter((l) => l.role === "user" && !l.handed && !l.text.startsWith("(typed) "))
+    .map((l) => `[+${mmss(Date.parse(l.at) - t0)}] User (NOT HANDED OVER to you during the call): ${oneLine(l.text)}`);
+}
+
+function conversation(c, budget) {
+  const t0 = c.liveAt || c.createdAt;
+  const items = [];
+  const add = (s, keep) => items.push({ s, keep, t: estimateTokens(s) + 1 });
+  for (const l of c.transcript) {
+    const at = "[+" + mmss(Date.parse(l.at) - t0) + "] ";
+    if (l.role === "user") {
+      const reached = l.handed || l.text.startsWith("(typed) ");
+      if (reached) add(at + "User: " + clip(l.text, 1500));
+      else add(at + "User (not handed over, in full above): " + clip(l.text, 120), true);
+    } else if (l.role === "voice") add(at + "Voice: " + clip(l.text, 600));
+    else if (l.role === "request") add(at + "-> handed to you as " + clip(l.text, 300));
+    else if (l.role === "claude") add(at + (l.text.startsWith("(progress) ") ? "Claude (progress): " + clip(l.text.slice(11), 4000) : "Claude: " + clip(l.text, 4000)));
+    else if (/^(confirmation |instruction to the voice)/.test(l.text)) add(at + "(" + clip(l.text, 400) + ")");
+  }
+  let total = items.reduce((n, i) => n + i.t, 0), dropped = 0;
+  // Over budget: first shorten every long line, then drop the oldest, never a line that did not
+  // reach Claude (its place in the conversation is the context for the work).
+  if (total > budget) {
+    for (const i of items) if (!i.keep && i.s.length > 200) { total -= i.t; i.s = clip(i.s, 200); i.t = estimateTokens(i.s) + 1; total += i.t; }
+  }
+  for (let k = 0; k < items.length && total > budget; ) {
+    if (items[k].keep) { k++; continue; }
+    total -= items[k].t;
+    items.splice(k, 1);
+    dropped++;
+  }
+  const lines = items.map((i) => i.s);
+  if (dropped) lines.unshift(`(${dropped} earlier line(s) left out for length${c.logFile ? "; they are in the transcript file" : ""})`);
+  return lines.join("\n");
+}
+
+function mmss(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+// Keep lines in order while they fit the token cap, and say how many did not.
+function capLines(lines, cap, where) {
+  const out = [];
+  let used = 0;
+  for (const l of lines) {
+    const t = estimateTokens(l) + 1;
+    if (used + t > cap) break;
+    out.push(l);
+    used += t;
+  }
+  if (out.length < lines.length) out.push(`(${lines.length - out.length} more not shown here for length${where ? "; " + where : ""})`);
+  return out;
+}
+
 function endedResult(c) {
   const mins = minutesLive(c);
-  const unanswered = c.queue.length + c.inFlight.size;
-  return text([
+  /* A request whose action the user declined on the page is not unfinished work, and one whose
+     approval the hang-up cut off still needs a yes. Say which is which. */
+  const open = capLines([...c.inFlight.values(), ...c.queue].map((r) => `${r.id} "${clip(r.text, 600).replace(/"/g, "'")}"`
+    + (r.declined ? ` (the user clicked Decline on "${clip(r.declined, 200).replace(/"/g, "'")}": do not redo that)` : "")
+    + (r.unconfirmed ? ` (the call ended before the user approved "${clip(r.unconfirmed, 200).replace(/"/g, "'")}": ask in this chat first)` : "")),
+    3000, "each is in the conversation as a hand-over");
+  const head = [
     `CALL ENDED (${c.endReason}). ${mins.toFixed(1)} minutes live, about $${(mins * PRICE_PER_MIN).toFixed(2)} of OpenAI voice time.`,
-    unanswered ? `${unanswered} request(s) were not answered on the call: ${[...c.inFlight.values(), ...c.queue].map((r) => `"${r.text}"`).join(", ")}.` : "",
-    c.logFile ? `Transcript: ${c.logFile}` : `What the user asked for: ${c.transcript.filter((l) => l.role === "request").map((l) => l.text.replace(/^r\d+: /, "")).join(" | ") || "nothing"}.`,
-    "Stop calling call_next. Tell the user in a few lines what was done on the call.",
-  ].filter(Boolean).join("\n"));
+    "",
+    "The call is over; the work is not. Stop calling call_next, and now, in this session:",
+    "1. Go through the conversation below and list everything the user asked for, decided or said they want, including what the voice answered on its own and every line marked NOT HANDED OVER.",
+    "2. Do each item that was not fully done and answered on the call, as if the user had typed it in this chat. The call page is gone, so call_say and call_confirm no longer work: before anything destructive or outward-facing (deleting, force-pushing, deploying, sending a message or email, spending money, changing credentials or permissions), ask in this chat and wait for the answer, because it came from transcribed speech. Never redo something the user declined on the call.",
+    "3. If the voice told the user something wrong, correct it.",
+    "4. Then write the user a short report: what was done on the call, what you did after it, and anything still open.",
+    open.length ? `\nHanded to you but not answered on the call: ${open.join(", ")}` : "",
+    c.logFile ? `\nTranscript: ${c.logFile}` : "",
+  ].filter((s, i) => s || i === 1).join("\n");
+  const all = missedLines(c);
+  const gone = capLines(all, 11000, c.logFile ? "read them in the transcript file" : "the transcript was not kept on disk");
+  const missed = all.length ? `\n\n${all.length} thing(s) the user said never reached you during the call:\n${gone.join("\n")}` : "";
+  const intro = "\n\nThe whole conversation, oldest first. User lines are the user's own words (transcribed speech, so words can be misheard). Voice lines are the voice model: not the user, not you, and it can be wrong. Claude lines are what you said.\n\n";
+  const convo = conversation(c, HANDOFF_TOKENS - estimateTokens(head + missed + intro));
+  return text(head + missed + (convo ? intro + convo : "\n\nNothing was said on the call."));
 }
 
 /* Anything spoken goes to OpenAI. A key read out loud is a leaked key, and no spoken sentence
@@ -380,11 +520,12 @@ export function voiceInstructions(focus) {
     "You cannot see the screen, read files, run anything or look anything up yourself. Claude can: it has its own tools on this computer and works on one request at a time. You are its voice.",
     "",
     "How to handle what the user says:",
-    "- Anything about the project, files, code, the computer, the web, their accounts, or any request to DO something: hand it to Claude (delegate). Say a very short acknowledgement first, such as \"On it.\" or \"Let me check.\", then stop talking and wait.",
+    "- Hand EVERYTHING the user says to Claude (delegate): every request, instruction, idea, decision and question, including questions about you, about Claude, about this call, what you or Claude can do, and what is remembered. Say a very short acknowledgement first, such as \"On it.\" or \"Let me check.\", then stop talking and wait.",
+    "- The only exceptions, which you answer yourself in one short sentence: a bare greeting, a thank-you, or a goodbye. Anything more than that goes to Claude, even if you think you know the answer.",
+    "- Never answer a question yourself and never explain how this call works. You do not know; Claude does. If you ever have to say it: everything said on this call is kept and handed to Claude, which works on it during the call and, when the call ends, reads the whole conversation and finishes anything left over.",
     "- When Claude's answer arrives, say it in your own words, briefly. Keep numbers, names, file names and commands exactly as given. Never invent a result and never guess what Claude found.",
     "- A progress note from Claude: pass it on in a few words. The work is still running.",
     "- While you wait, stay quiet unless the user speaks. If they ask, say Claude is still working.",
-    "- Greetings, thanks and small talk you may answer yourself, in one short sentence.",
     "- If Claude asks the user something or asks them to confirm an action, ask it clearly, then hand their reply to Claude.",
     "- Never read out a password, API key, token or other secret, even if an answer contains one.",
     "- Keep every reply short. This is a spoken conversation.",
@@ -745,6 +886,26 @@ function postState(res, c, body) {
     return sendJson(res, 200, { ok: true });
   }
   if (s === "closed") {
+    /* Words said just before End call are posted at the same moment as this hang-up, and the
+       hand-off to Claude goes out the instant the call ends. So the hang-up carries them itself,
+       and their own post, whenever it lands, is recognised as the same line. */
+    if (isOpen(c) && Array.isArray(body.tail)) {
+      for (const l of body.tail.slice(-4)) {
+        const role = l && l.role === "voice" ? "voice" : "user";
+        const t = String((l && l.text) || "").trim().slice(0, 4000);
+        if (!t) continue;
+        const id = lineId(l);
+        if (id) {
+          // Its own post may have landed first: then it is already here. Same id, same line.
+          if (c.lineIds.has(id)) continue;
+          c.lineIds.add(id);
+        } else {
+          if (c.transcript.slice(-8).some((x) => x.role === role && x.text === t)) continue;
+          c.tailKeys.add(role + "\n" + t);
+        }
+        remember(c, role, t);
+      }
+    }
     endCall(String(body.reason || "hung up on the call page").slice(0, 200), body.usage || null);
     return sendJson(res, 200, { ok: true });
   }
@@ -774,10 +935,18 @@ function postDelegate(res, c, body) {
       pending.delegationIds.push(id);
       return sendJson(res, 200, { id: pending.id, attached: true, ...ackFor(c, pending) });
     }
+    /* The page hands over what the voice kept to itself; if the voice delegates it after all,
+       Claude may have answered already. That is the same request, not a new one to say again. */
+    const done = c.lastAnswered;
+    if (done && id && Date.now() - done.at < 20000 && (!pending || pending.at < done.r.at)) {
+      return sendJson(res, 200, { id: done.r.id, attached: true, answered: true });
+    }
     return sendJson(res, 400, { error: "I did not catch a request there. Could you say it again?" });
   }
   const t = textSaid;
-  const { r, ahead, claudeWaiting } = enqueue(c, t, recent, id, "voice");
+  // Only a hand-over with no delegation of the voice's own can be one the voice did not make.
+  const source = !id && body.source === "overheard" ? "overheard" : "voice";
+  const { r, ahead, claudeWaiting } = enqueue(c, t, recent, id, source, said);
   return sendJson(res, 200, { id: r.id, ahead, claudeWaiting, claude: claudeStatus(c).claude });
 }
 
@@ -795,10 +964,20 @@ function postTyped(res, c, body) {
   return sendJson(res, 200, { id: r.id, ahead, claudeWaiting, claude: claudeStatus(c).claude });
 }
 
+// The page numbers its lines; only a small positive integer is an id.
+function lineId(l) {
+  const n = Number(l && l.id);
+  return Number.isInteger(n) && n > 0 && n < 1e7 ? String(n) : "";
+}
+
 function postTranscript(res, c, body) {
   const role = body.role === "voice" ? "voice" : "user";
   const t = String(body.text || "").trim();
-  if (t) remember(c, role, t);
+  if (!t) return sendJson(res, 200, { ok: true });
+  const id = lineId(body);
+  if (id) {
+    if (!c.lineIds.has(id)) { c.lineIds.add(id); remember(c, role, t); }
+  } else if (!c.tailKeys.delete(role + "\n" + t)) remember(c, role, t);
   return sendJson(res, 200, { ok: true });
 }
 
@@ -809,6 +988,7 @@ function postConfirm(res, c, body) {
   if (!pending) return sendJson(res, 404, { error: "that confirmation is no longer open" });
   c.confirms.delete(String(body.id));
   const yes = body.approved === true;
+  if (pending.r) { if (yes) { delete pending.r.declined; delete pending.r.unconfirmed; } else pending.r.declined = pending.action; }
   remember(c, "system", `confirmation ${body.id}: ${yes ? "approved" : "declined"} on the page: ${pending.action}`);
   pending.resolve(yes
     ? `APPROVED: the user clicked Approve on the call page for exactly this: ${pending.action}`
@@ -888,6 +1068,17 @@ function fail(s) {
   return { content: [{ type: "text", text: String(s) }], isError: true };
 }
 
+/* The page needs to know when the user is dictating, or it would hand every thinking pause to
+   Claude as a request. Claude is asked to say so; the text is the fallback. */
+export function instructMode(args) {
+  const m = String((args && args.mode) || "").toLowerCase();
+  if (m === "listening" || m === "normal") return m;
+  const t = String((args && args.text) || "");
+  // Only explicit exit phrasing leaves the mode: "stay silent until the user says over to you" enters it.
+  if (/listening mode (?:is )?(?:over|off|ended|done)|(?:leave|exit|end|stop)(?: the)? listening mode|resume normal/i.test(t)) return "normal";
+  return /listening mode/i.test(t) ? "listening" : null;
+}
+
 export const TOOLS = [
   {
     name: "call_start",
@@ -918,6 +1109,7 @@ export const TOOLS = [
         text: { type: "string", description: "What to tell the user, 1-3 short spoken sentences." },
         id: { type: "string", description: "The request id from call_next (for example r3). Defaults to the latest request." },
         final: { type: "boolean", description: "true = this answers the request (default). false = progress note, still working." },
+        quiet: { type: "boolean", description: "true = close the request WITHOUT speaking: only for something the voice kept to itself and already answered well (small talk), so the user does not hear it twice." },
       },
       required: ["text"],
     },
@@ -941,6 +1133,7 @@ export const TOOLS = [
       type: "object",
       properties: {
         text: { type: "string", description: "The instruction for the voice model, one or two plain sentences." },
+        mode: { type: "string", enum: ["listening", "normal"], description: "\"listening\" when entering listening mode, \"normal\" when leaving it. The call page holds back its own hand-overs while the user dictates." },
       },
       required: ["text"],
     },
@@ -991,7 +1184,8 @@ async function toolCall(name, args, ctx) {
   }
 
   if (name === "call_confirm") {
-    if (!call || !isOpen(call)) return fail("No call is open, so there is nobody to confirm with. Ask in the Claude window instead.");
+    if (!call) return fail("No call is open, so there is nobody to confirm with. Ask in the Claude window instead.");
+    if (!isOpen(call)) return text("DECLINED: the call has ended, so there is nobody to confirm with on it. Do not do it now; ask in this chat instead. " + AFTER_END);
     const c = call;
     c.lastLoopAt = Date.now();
     const action = String(args.action || "").trim().slice(0, 1200);
@@ -1000,14 +1194,17 @@ async function toolCall(name, args, ctx) {
     if (!c.sse.size) return text("DECLINED: the call page is not connected, so the user cannot see the action. Do not do it; ask again once the page is back.");
     const id = "k" + crypto.randomBytes(4).toString("hex");
     remember(c, "system", `confirmation ${id} asked: ${action}`);
+    // The request this approval belongs to, so the end-of-call hand-off can say how it went.
+    const r = [...c.inFlight.values()].at(-1) || null;
     return await new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (!c.confirms.has(id)) return;
         c.confirms.delete(id);
+        if (r) r.unconfirmed = action;
         push({ type: "confirm_done", id, approved: false, expired: true });
         resolve(text(`DECLINED: no answer on the call page within ${CONFIRM_WAIT_S} seconds. Do not do it. Tell the user briefly with call_say.`));
       }, CONFIRM_WAIT_S * 1000);
-      c.confirms.set(id, { action, why, resolve: (s) => { clearTimeout(timer); resolve(text(s)); } });
+      c.confirms.set(id, { action, why, r, resolve: (s) => { clearTimeout(timer); resolve(text(s)); } });
       /* The card shows the action EXACTLY, unredacted: it is drawn on this computer only (never
          sent to OpenAI; only `why` is spoken), and an approval of a line with parts blanked
          out is an approval of something the user could not read. */
@@ -1060,9 +1257,11 @@ async function toolCall(name, args, ctx) {
     /* An explicit id that is no longer in flight (already answered, or never existed) must not
        fall through to closing some OTHER request: it goes out as a plain note. */
     const r = args.id ? (c.inFlight.get(String(args.id)) || null) : ([...c.inFlight.values()].at(-1) || null);
-    const delivered = push({ type: "say", id: r ? r.id : null, text: said, final, delegationIds: r ? r.delegationIds : [] });
-    remember(c, "claude", (final ? "" : "(progress) ") + said);
-    if (final && r) c.inFlight.delete(r.id);
+    // Quiet closes a request the voice already handled well: the voice is told, not asked to speak.
+    const quiet = final && args.quiet === true;
+    const delivered = push({ type: "say", id: r ? r.id : null, text: said, final, quiet, delegationIds: r ? r.delegationIds : [] });
+    remember(c, "claude", (quiet ? "(closed quietly) " : final ? "" : "(progress) ") + said);
+    if (final && r) { c.inFlight.delete(r.id); c.lastAnswered = { r, at: Date.now() }; }
     pushStatus();
     return text(delivered
       ? `Sent to the call${r ? ` as the ${final ? "answer to" : "progress on"} ${r.id}` : ""}. Now call call_next.`
@@ -1073,11 +1272,11 @@ async function toolCall(name, args, ctx) {
     if (!call) return fail("No call is open.");
     const c = call;
     c.lastLoopAt = Date.now();
-    if (!isOpen(c)) return text("The call has already ended, so the instruction was not sent.");
+    if (!isOpen(c)) return text("The call has already ended, so the instruction was not sent. " + AFTER_END);
     // Never spoken, but it still leaves this process for OpenAI, so it gets the same scrubbing.
     const said = fitSpoken(speakable(args.text));
     if (!said) return fail("Nothing to send: text was empty after removing markdown.");
-    const delivered = push({ type: "instruct", text: said });
+    const delivered = push({ type: "instruct", text: said, mode: instructMode(args) });
     remember(c, "system", "instruction to the voice: " + said);
     return text(delivered
       ? "Instruction sent to the voice. Now call call_next."
@@ -1085,7 +1284,8 @@ async function toolCall(name, args, ctx) {
   }
 
   if (name === "call_end") {
-    if (!call || !isOpen(call)) return text("No call is open.");
+    if (!call) return text("No call is open.");
+    if (!isOpen(call)) return text("The call has already ended. " + AFTER_END);
     const c = call;
     c.state = "ending";
     push({ type: "end", reason: String(args.reason || "Claude hung up") });

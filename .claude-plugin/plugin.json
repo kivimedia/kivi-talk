@@ -1,6 +1,6 @@
 {
   "name": "kivi-talk",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Kivi Talk: talk out loud to the Claude Code session you are in. The voice is powered by OpenAI GPT-Live on your own OpenAI key; your session does the work with its own tools while you talk. Type /talk.",
   "author": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
   "repository": "https://github.com/kivimedia/kivi-talk",
@@ -16,7 +16,7 @@
     "keep_transcripts": {
       "type": "boolean",
       "title": "Keep call transcripts",
-      "description": "Save what was said on each call to a file in the plugin's data folder on this computer. Off by default; the call is always summarised in your Claude session either way.",
+      "description": "Save what was said on each call to a file in the plugin's data folder on this computer. Off by default. Either way, when a call ends the whole conversation is handed to your Claude session so it can finish what you asked for.",
       "default": false
     }
   }

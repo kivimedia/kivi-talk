@@ -143,6 +143,8 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   var startedAt = 0, lastActivity = 0, usage = null, warnedMax = false;
   var closeTimer = null, connectTimer = null, closingReason = "";
   var heardBuf = "", saidBuf = "", sinceHandover = [], recent = [];
+  var listening = false, delegating = 0, claudeAsked = false, overhearTimer = null, lastSaidAt = 0;
+  var awaitingSince = 0;   // a hand-over Claude has not responded to yet (see overhear)
   var claude = { claude: CFG.claude || "away", queue: CFG.queue || 0, on: CFG.on || "" };
   var workingSince = 0;
   var sseDownSince = 0, seq = 0;
@@ -263,10 +265,13 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       thinking(lastOf(m.delegationIds), "Claude has started working on: " + m.text + ". No result yet.");
       return;
     }
-    if (m.type === "say") { onSay(m); return; }
+    if (m.type === "say") { claudeResponded(); onSay(m); return; }
     if (m.type === "instruct") {
       // Not speech: it changes how the voice behaves (listening mode) for the rest of the call.
       addLine("Call", "Claude told the voice: " + m.text, "note");
+      if (m.mode === "listening") listening = true;
+      else if (m.mode === "normal") listening = false;
+      claudeResponded();
       instruct(m.text);
       return;
     }
@@ -298,9 +303,17 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
      under the id of the request they belong to. Typed requests have none and go out as null. */
   function onSay(m) {
     lastActivity = Date.now();
+    // Any question in the answer (or "there is more"): a bare "ok" after it is a reply, not small talk.
+    if (m.final) claudeAsked = /[?？]|ask if you want the rest\.$/.test(m.text);
     flushSaid();   // whatever the voice said before this answer belongs above it
     addLine("Claude", m.text, m.final ? "claude" : "progress");
     if (phase === "live") setStatus(m.final ? "Claude answered." : "Claude is still working.", m.text);
+    /* Closed quietly: the voice already answered this well by itself. It is told, so it knows,
+       but nothing is said twice. A request the voice itself delegated still gets its answer. */
+    if (m.quiet && !(m.delegationIds && m.delegationIds.length)) {
+      thinking(null, "Claude saw what the user just said and has nothing to add: " + m.text);
+      return;
+    }
     commentary(lastOf(m.delegationIds), m.final
       ? "Claude's answer: " + m.text
       : "Progress note from Claude (the work is still running): " + m.text);
@@ -459,6 +472,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     }
     if (t === "session.output_transcript.delta") {
       if (heardBuf.trim()) flushHeard();
+      lastSaidAt = Date.now();
       saidBuf += ev.delta || "";
       showInterim("Voice", saidBuf);
       settle("said", flushSaid, 1500);
@@ -493,7 +507,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
 
   /* The whole utterance has to be a goodbye ("Bye, Claude.", "OK, hang up please.", "Thanks,
      goodbye!"), so "don't hang up yet" or "say bye to the old API" never end the call. */
-  var HANGUP = /^\s*(?:(?:ok(?:ay)?|thanks?|thank you|great|perfect|all ?right|alright|cool)[,.!]?\s*)*(?:please[,]?\s+)?(?:hang up|end (?:the|this) call|bye(?:[- ]bye)?|good ?bye)(?:[,.!]?\s*(?:claude|now|for now|please|thanks|thank you|then))*[\s.!]*$/i;
+  var HANGUP = /^\s*(?:(?:ok(?:ay)?|thanks?|thank you|great|perfect|all ?right|alright|cool|תודה(?: רבה)?|אוקיי?|סבבה|יופי|טוב)[,.!]?\s*)*(?:please[,]?\s+)?(?:hang up|end (?:the|this) call|bye(?:[- ]bye)?|good ?bye|ביי(?:[- ]ביי)?|להתראות|יאללה ביי|תנתק|נתק|לנתק|סיים את השיחה)(?:[,.!]?\s*(?:claude|now|for now|please|thanks|thank you|then|קלוד|תודה))*[\s.!]*$/i;
 
   function flushHeard() {
     var t = heardBuf.trim();
@@ -504,7 +518,9 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     recent.push({ role: "user", text: t });
     if (recent.length > 24) recent.shift();
     sinceHandover.push(t);
-    api("/transcript", { role: "user", text: t }).catch(noop);
+    post("user", t);
+    if (listening && STOP_CUE.test(t)) listening = false;
+    armOverhear();
     if (HANGUP.test(t) && phase === "live") {
       instruct("The user is ending the call. Say a short goodbye, nothing else.");
       var saidByeAt = Date.now();
@@ -521,7 +537,27 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     addLine("Voice", t, "voice");
     recent.push({ role: "voice", text: t });
     if (recent.length > 24) recent.shift();
-    api("/transcript", { role: "voice", text: t }).catch(noop);
+    post("voice", t);
+  }
+
+  /* A line's own post can land after the hang-up that follows it a moment later, and Claude's
+     end-of-call hand-off goes out the instant the call ends. So the hang-up carries the last few
+     seconds itself; the bridge keeps one copy of each line. */
+  var posted = [], lineSeq = 0;
+  function post(role, t) {
+    // Numbered, so the bridge knows a late post and its copy in the hang-up are one line.
+    var id = ++lineSeq;
+    posted.push({ role: role, text: t, at: Date.now(), id: id });
+    if (posted.length > 6) posted.shift();
+    api("/transcript", { role: role, text: t, id: id }).catch(noop);
+  }
+  function tailNow() {
+    var now = Date.now();
+    var tail = posted.filter(function (p) { return now - p.at < 4000; })
+      .map(function (p) { return { role: p.role, text: p.text, id: p.id }; });
+    if (heardBuf.trim()) tail.push({ role: "user", text: heardBuf.trim(), id: ++lineSeq });
+    if (saidBuf.trim()) tail.push({ role: "voice", text: saidBuf.trim(), id: ++lineSeq });
+    return tail.slice(-4);
   }
 
   /* The delegation event carries an id and nothing else: not the question, not the sentence that
@@ -543,14 +579,76 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
 
   async function onDelegation(id) {
     if (!id) return;
-    await userQuiet(1000, 5000);
-    flushHeard();
-    flushSaid();
+    listening = false;   // in listening mode the voice delegates only on the user's stop cue
+    delegating++;
+    try {
+      await userQuiet(1000, 5000);
+      flushHeard();
+      flushSaid();
+      await handOver(id, sinceHandover.splice(0), "voice");
+    } finally { delegating--; }
+  }
+
+  /* The voice decides what to hand over, and it gets that wrong: on 26-Sep it answered "what is
+     kept after the call?" itself, wrongly, and Claude never heard the question. So speech is never
+     left with the voice alone. Whatever the user said that was not handed over by the time both
+     sides have gone quiet goes to Claude anyway. A bare greeting, thanks or acknowledgement stays
+     with the voice (unless Claude just asked something), and dictation in listening mode waits
+     for the user's stop cue. Nothing is lost either way: the end of the call hands Claude every
+     line. */
+  var OVERHEAR_MS = 6000;
+  var SMALLTALK = /^\s*(?:(?:hi|hello|hey|hiya|good (?:morning|afternoon|evening)|thanks?|thank you|cheers|ok(?:ay)?|cool|great|perfect|nice|awesome|got it|sounds good|all ?right|alright|mm+[- ]?hmm+|uh[- ]?huh|שלום|היי|הי|בוקר טוב|ערב טוב|תודה(?: רבה)?|אוקיי?|סבבה|יופי|מעולה|אחלה|בסדר|מגניב|קלוד)(?:[\s,]+(?:claude|there|so much|very much|a lot|רבה|קלוד))*[\s,.!]*)+$/i;
+  /* The user's own stop cue ends dictation even if the voice leaves listening mode without
+     delegating what was dictated. */
+  var STOP_CUE = /(?:^|[\s,.!])(?:go ahead|that'?s it|that is it|that'?s all|over to you|i'?m done|i am done|זהו|סיימתי|יאללה)[\s,.!]*$/i;
+
+  function armOverhear() {
+    clearTimeout(overhearTimer);
+    overhearTimer = setTimeout(overhear, OVERHEAR_MS);
+  }
+
+  /* Two holds, each with a limit so the net can never stay off for good:
+     - Claude has not yet responded to the latest hand-over. "Let me dictate, don't interrupt"
+       followed at once by dictation must not be chopped into requests before Claude has had the
+       chance to switch listening mode on. Claude's first word (progress, answer or instruction)
+       lifts the hold; so does 30 seconds of nothing.
+     - Listening mode: dictation waits for the stop cue, but a minute of silence ends it anyway
+       (the voice may have left the mode without handing anything over). */
+  var AWAIT_MAX_MS = 30000, LISTEN_QUIET_MS = 60000;
+
+  function claudeResponded() {
+    awaitingSince = 0;
+    if (sinceHandover.length) armOverhear();
+  }
+
+  function overhear() {
+    overhearTimer = null;
+    if (phase !== "live" || delegating || !sinceHandover.length) return;
+    var now = Date.now();
+    if (awaitingSince && now - awaitingSince < AWAIT_MAX_MS) { overhearTimer = setTimeout(overhear, 2000); return; }
+    if (listening) {
+      if (now - lastHeardAt < LISTEN_QUIET_MS) { overhearTimer = setTimeout(overhear, 5000); return; }
+      listening = false;
+    }
+    // Someone is still talking, or the voice may be about to delegate after its reply: look again.
+    if (heardBuf.trim() || saidBuf.trim() || now - lastHeardAt < 1500 || now - lastSaidAt < 2000) {
+      overhearTimer = setTimeout(overhear, 1500);
+      return;
+    }
+    var chat = !claudeAsked && sinceHandover.every(function (t) { return SMALLTALK.test(t) || HANGUP.test(t); });
     var said = sinceHandover.splice(0);
-    setStatus("Handing your request to Claude...", said.join(" "));
+    if (chat) return;
+    addLine("Call", "the voice did not pass that on, so it went to Claude directly", "note");
+    handOver(null, said, "overheard");
+  }
+
+  async function handOver(id, said, source) {
+    clearTimeout(overhearTimer);
+    claudeAsked = false;
+    if (said.length) setStatus("Handing your request to Claude...", said.join(" "));
     var r, j;
     try {
-      r = await api("/delegate", { delegation_id: id, said: said, recent: recent.slice(-12) });
+      r = await api("/delegate", { delegation_id: id, said: said, recent: recent.slice(-12), source: source });
       j = await r.json().catch(function () { return {}; });
     } catch (e) {
       commentary(id, "Tell the user Claude could not be reached just now.");
@@ -563,10 +661,17 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       return;
     }
     lastActivity = Date.now();
+    if (!j.attached && !j.answered) awaitingSince = Date.now();
+    if (j.answered) {
+      commentary(id, "Claude has already answered this; you passed its answer on just now. Say nothing more about it unless the user asks.");
+      return;
+    }
     if (j.attached) {
       thinking(id, "This is the same request Claude is already handling. Wait for its answer.");
       return;
     }
+    // The voice did not hand this over, so it is not waiting on it: no notices about a queue.
+    if (source === "overheard") return;
     if (!j.claudeWaiting && j.ahead > 0) {
       commentary(id, "Claude is still busy with an earlier request. Tell the user this one is queued and Claude will get to it next" + (j.ahead > 1 ? " (" + j.ahead + " ahead of it)" : "") + ".");
     } else if (!j.claudeWaiting && j.claude === "away") {
@@ -606,6 +711,8 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     clearTimeout(connectTimer);
     flushHeard();
     flushSaid();
+    clearTimeout(overhearTimer);
+    var tail = tailNow();
     clearInterim();
     teardown();
     hideConfirm(true);
@@ -616,14 +723,14 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     var took = wasLive ? Date.now() - startedAt : 0;
     setStatus("Call ended.", reason + (wasLive ? " " + mmss(took) + " live, about $" + (took / 60000 * CFG.pricePerMinute).toFixed(2) + "." : "") + " Run /talk in Claude to call again.");
     addLine("Call", "ended: " + reason, "note");
-    api("/state", { state: "closed", reason: reason, usage: usage }, true).catch(noop);
+    api("/state", { state: "closed", reason: reason, usage: usage, tail: tail }, true).catch(noop);
     if (es) { try { es.close(); } catch (e) {} es = null; }
   }
 
   window.addEventListener("pagehide", function () {
     if (phase === "live" || phase === "connecting" || phase === "closing") {
       liveSend({ type: "session.close" });
-      api("/state", { state: "closed", reason: "the call page was closed", usage: usage }, true).catch(noop);
+      api("/state", { state: "closed", reason: "the call page was closed", usage: usage, tail: tailNow() }, true).catch(noop);
     }
   });
 

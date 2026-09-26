@@ -11,7 +11,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_kivi-talk_voice__call_next",
+        "matcher": "^mcp__plugin_kivi-talk_voice__call_(next|say)$",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" classify \"${CLAUDE_PLUGIN_DATA}\"" }
         ]

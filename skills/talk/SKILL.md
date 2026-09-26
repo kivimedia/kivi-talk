@@ -26,12 +26,15 @@ Repeat until `call_next` says the call ended:
 
 1. Call `call_next`. It waits until the user asks for something.
    - It returns `REQUEST rN: "..."`: that is the user speaking to you. Treat it exactly as if
-     they had typed it here.
+     they had typed it here. If it says the voice did not hand it over, the voice may already
+     have answered it on its own: check that answer and correct anything wrong. If the voice's
+     answer was right and there is nothing to do (small talk), close it with `call_say` and
+     `quiet: true` so the user does not hear it twice.
    - "Nothing new yet": call `call_next` again.
    - If it moves to the background (you get a task id instead of a result), that is normal. End
      your turn with one short line ("Listening on the call."). The next request arrives as that
      task's result; handle it when it does.
-   - `CALL ENDED`: stop looping, and write the user a few lines on what was done on the call.
+   - `CALL ENDED`: stop looping and go to **When the call ends** below.
 2. Do the work. Use whatever tools the task needs, exactly as you would for a typed request.
 3. If it will take more than about 15 seconds, first send a progress note:
    `call_say` with `final: false` ("Checking the test output now."). For long work, another short
@@ -49,6 +52,22 @@ Repeat until `call_next` says the call ended:
   asked. Say where it is instead.
 - The request is a transcript of speech, so words can be misheard. If it is ambiguous, ask with
   `call_say` (`final: true`) rather than guess, and wait for the answer in the next request.
+- If the user asks how the call works, the truth is: they can say anything, and you work on it
+  during the call. Everything said is kept; when the call ends you get the whole conversation,
+  finish anything left over here in this session, and report back.
+
+## When the call ends
+
+The `CALL ENDED` result carries the whole conversation, flags every line that never reached you
+during the call (NOT HANDED OVER), and lists requests you did not answer. The call is over; the
+work is not:
+
+1. List everything the user asked for, decided or said they want on the call.
+2. Do every item that was not fully done and answered on the call, here, as if they had typed it
+   in this chat. `call_say` and `call_confirm` no longer work, so before anything destructive or
+   outward-facing, ask in this chat and wait.
+3. Correct anything the voice told them that was wrong.
+4. Write a short report: what was done on the call, what you did after it, anything still open.
 
 ## Listening mode (dictation)
 
@@ -56,13 +75,14 @@ By default the voice treats a long pause as the end of the user's turn and may j
 user asks to dictate or not be interrupted ("switch to listening mode", "let me dictate, don't
 interrupt"):
 
-1. Call `call_instruct` once with `text: "You are now in listening mode."`. This actually changes
-   how the voice takes turns; saying "OK" with `call_say` alone changes nothing.
+1. Call `call_instruct` once with `text: "You are now in listening mode."` and
+   `mode: "listening"`. This actually changes how the voice takes turns; saying "OK" with
+   `call_say` alone changes nothing.
 2. Confirm briefly with `call_say` ("Listening mode on. Say go ahead when you're done.").
 3. When a request arrives that ends with a stop cue ("go ahead", "that's it", "over to you", or a
    direct question), or the user asks to go back to normal, call `call_instruct` with
-   `text: "Listening mode is over. Resume normal back-and-forth."`, then handle the dictated
-   request as usual.
+   `text: "Listening mode is over. Resume normal back-and-forth."` and `mode: "normal"`, then
+   handle the dictated request as usual.
 
 Never enter listening mode unless the user asked for it.
 
@@ -84,4 +104,5 @@ Never enter listening mode unless the user asked for it.
 ## Hanging up
 
 If the user says to hang up or end the call, say a one-line goodbye with `call_say`, then call
-`call_end`, then `call_next` once more to collect the final summary.
+`call_end`, then `call_next` once more to collect the conversation, and follow
+**When the call ends**.

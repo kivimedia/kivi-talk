@@ -94,6 +94,14 @@ function out(obj) {
   process.stdout.write(JSON.stringify(obj));
 }
 
+// A tool result arrives as a string, a content block, or a list of them.
+function textOf(r) {
+  if (typeof r === "string") return r;
+  if (Array.isArray(r)) return r.map(textOf).join("\n");
+  if (r && typeof r === "object") return typeof r.text === "string" ? r.text : textOf(r.content);
+  return "";
+}
+
 async function main() {
   let input = {};
   try { input = JSON.parse((await readStdin()) || "{}"); } catch {}
@@ -119,6 +127,26 @@ async function main() {
      came from, honestly: transcribed speech from the user's microphone, not speaker-verified.
      Only the request line itself is passed on, never the conversation around it. */
   if (mode === "classify") {
+    /* At the end of a call Claude is told to finish what the user asked for on it. Pass on only
+       the user's own unfinished asks: never the voice's lines, never anything already done. */
+    const whole = textOf(input.tool_response);
+    // Only the bridge's own hand-off starts this way (call_next, or call_say after the call ended).
+    if (/^(?:The call has already ended, so nothing was spoken\. )?CALL ENDED \(/.test(whole)) {
+      const asks = new Set();
+      for (const m of whole.matchAll(/^\[[^\]\n]*\] User \(NOT HANDED OVER to you during the call\): (.*)$/gm)) asks.add(m[1]);
+      const open = whole.match(/^Handed to you but not answered on the call: (.*)$/m);
+      // Something the user clicked Decline on is not an ask.
+      if (open) for (const m of open[1].matchAll(/r\d+ "([^"]*)"( \(the user clicked Decline)?/g)) if (!m[2]) asks.add(m[1]);
+      if (!asks.size) return;
+      const list = [...asks].map((a) => `"${a.replace(/\s+/g, " ").slice(0, 300)}"`).join(" | ").slice(0, 1500);
+      out({
+        hookSpecificOutput: {
+          hookEventName: "PostToolUse",
+          classifierContext: `This call_next result ends a voice call the user started with /talk. Claude was told to finish, in this session, what the user asked for on it and did not get done; destructive or outward-facing steps must be asked in the chat first. The user's own unfinished words, transcribed from their microphone (speech recognition, not speaker-verified): ${list}`,
+        },
+      });
+      return;
+    }
     const raw = JSON.stringify(input.tool_response || "");
     const m = raw.match(/REQUEST (r\d+) \((typed on the call page|spoken by the user[^)]*)\):\\n\\"([\s\S]*?)\\"\\n/);
     if (!m) return;

@@ -9,7 +9,12 @@ commands. That is the point of it, and it is also why the defaults below exist.
 |---|---|
 | Your microphone audio during a call | Your files, code and command output |
 | What Claude says out loud (short spoken answers) | Claude's full work and reasoning |
-| The call instructions (project folder name, the focus you typed) | Call transcripts (`calls/*.jsonl` in the plugin data folder) |
+| The call instructions (project folder name, the focus you typed) | Call transcripts (`calls/*.jsonl` in the plugin data folder), only if you turn them on |
+
+When a call ends, the whole conversation (what the microphone heard, what the voice said, what
+Claude said) is handed to your Claude session so Claude can finish what you asked for. That puts
+it in the session like anything you type: Claude Code's own session log on your computer, and
+your Claude provider under its terms. This happens whether or not transcript files are on.
 
 Claude is told never to say secrets out loud. Treat anything it speaks as sent to OpenAI under
 your OpenAI account's data terms. If your employer restricts sending code or voice to third
@@ -29,9 +34,12 @@ parties, check before using it on that code.
 ## Voice-specific risks
 
 - **Anyone the microphone hears can speak to Claude.** A person in the room, or audio playing
-  from a video, can issue requests. Before anything destructive or outward-facing, Claude shows
+  from a video, can issue requests, and everything heard reaches Claude (the call page hands over
+  anything the voice did not). Before anything destructive or outward-facing, Claude shows
   the exact action on the call page and waits for a click on Approve; a spoken "yes" never counts,
-  and nothing is done if nobody clicks within about two minutes. Your Claude Code permission rules
+  and nothing is done if nobody clicks within about two minutes. After the call ends, Claude
+  finishes what was left over, and for those same actions it asks in the chat and waits for your
+  answer; something you declined on the call is never redone. Your Claude Code permission rules
   still apply on top. Use headphones and hang up when you are done.
 - **Speech recognition can mishear.** Claude is told to ask when a request is ambiguous.
 - **Content Claude reads is not you.** Instructions found inside files, web pages or tool output
