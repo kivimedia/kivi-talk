@@ -38,9 +38,9 @@ cloud sandboxes are not supported.
 /talk the failing tests   start a call about something specific
 ```
 
-The full name is `/kivi-talk:talk`. In the VS Code extension the slash menu matches from the start of
-the name, so typing `/talk` does not list it: press Enter anyway (it works), or type `/kivi` and pick
-`/kivi-talk:talk`.
+The full name is `/kivi-talk:talk`. Installed it while VS Code (or another Claude Code window) was
+already open? That window keeps its old command list: type `/reload-plugins` in its chat once, and
+`/talk` appears. Sending `/talk` works even before that.
 
 - Talk normally. Ask it to read, run, fix, explain, look things up: anything you would type.
 - For longer work you hear short progress notes. You can keep talking; new requests queue.
