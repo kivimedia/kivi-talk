@@ -25,10 +25,12 @@ async function boundCall(sid = "s") {
   return { b, page: await b.open() };
 }
 
-test("allow approves exactly the six call tools and nothing that merely contains their names", async () => {
+test("allow approves exactly the seven call tools and nothing that merely contains their names", async () => {
   const r = await runHook("allow", tmpDir("g"), { session_id: "s1", tool_name: "mcp__plugin_kivi-talk_voice__call_next" });
   assert.equal(r.code, 0);
   assert.equal(r.json.hookSpecificOutput.permissionDecision, "allow");
+  const ins = await runHook("allow", tmpDir("g"), { session_id: "s1", tool_name: "mcp__plugin_kivi-talk_voice__call_instruct" });
+  assert.equal(ins.json.hookSpecificOutput.permissionDecision, "allow", "entering listening mode never stops the call for a prompt");
   assert.equal(r.json.hookSpecificOutput.hookEventName, "PreToolUse");
   for (const name of ["mcp__evil__mcp__plugin_kivi-talk_voice__call_next", "mcp__plugin_kivi-talk_voice__call_nextx", "Bash", ""]) {
     assert.equal((await runHook("allow", tmpDir("g"), { tool_name: name })).out, "", `${name || "(empty)"} must not be approved`);
@@ -36,6 +38,7 @@ test("allow approves exactly the six call tools and nothing that merely contains
   const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, "hooks", "hooks.json"), "utf8"));
   const matcher = new RegExp(hooks.hooks.PreToolUse[0].matcher);
   assert.ok(matcher.test("mcp__plugin_kivi-talk_voice__call_confirm"));
+  assert.ok(matcher.test("mcp__plugin_kivi-talk_voice__call_instruct"));
   assert.ok(!matcher.test("mcp__evil__mcp__plugin_kivi-talk_voice__call_next"), "the matcher is anchored");
 });
 

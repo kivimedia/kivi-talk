@@ -264,6 +264,12 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       return;
     }
     if (m.type === "say") { onSay(m); return; }
+    if (m.type === "instruct") {
+      // Not speech: it changes how the voice behaves (listening mode) for the rest of the call.
+      addLine("Call", "Claude told the voice: " + m.text, "note");
+      instruct(m.text);
+      return;
+    }
     if (m.type === "confirm") { showConfirm(m); return; }
     if (m.type === "confirm_done") {
       confirmQueue = confirmQueue.filter(function (q) { return q.id !== m.id; });

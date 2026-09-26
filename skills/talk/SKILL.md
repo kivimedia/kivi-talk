@@ -50,6 +50,22 @@ Repeat until `call_next` says the call ended:
 - The request is a transcript of speech, so words can be misheard. If it is ambiguous, ask with
   `call_say` (`final: true`) rather than guess, and wait for the answer in the next request.
 
+## Listening mode (dictation)
+
+By default the voice treats a long pause as the end of the user's turn and may jump in. When the
+user asks to dictate or not be interrupted ("switch to listening mode", "let me dictate, don't
+interrupt"):
+
+1. Call `call_instruct` once with `text: "You are now in listening mode."`. This actually changes
+   how the voice takes turns; saying "OK" with `call_say` alone changes nothing.
+2. Confirm briefly with `call_say` ("Listening mode on. Say go ahead when you're done.").
+3. When a request arrives that ends with a stop cue ("go ahead", "that's it", "over to you", or a
+   direct question), or the user asks to go back to normal, call `call_instruct` with
+   `text: "Listening mode is over. Resume normal back-and-forth."`, then handle the dictated
+   request as usual.
+
+Never enter listening mode unless the user asked for it.
+
 ## Safety on a voice call
 
 - Before anything destructive or outward-facing (deleting files, force-pushing, deploying,

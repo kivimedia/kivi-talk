@@ -26,7 +26,7 @@ function rawGet(port, pathName, headers) {
   });
 }
 
-test("MCP handshake lists exactly the six call tools", async () => {
+test("MCP handshake lists exactly the seven call tools", async () => {
   const b = startBridge();
   try {
     const init = await b.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
@@ -34,7 +34,7 @@ test("MCP handshake lists exactly the six call tools", async () => {
     assert.equal(init.result.protocolVersion, "2025-06-18");
     const list = await b.rpc("tools/list", {});
     assert.deepEqual(list.result.tools.map((t) => t.name).sort(),
-      ["call_confirm", "call_end", "call_next", "call_say", "call_start", "call_status"]);
+      ["call_confirm", "call_end", "call_instruct", "call_next", "call_say", "call_start", "call_status"]);
     assert.equal((await b.rpc("does/not/exist", {})).error.code, -32601);
     assert.deepEqual((await b.rpc("ping", {})).result, {});
   } finally { b.stop(); }
@@ -47,7 +47,39 @@ test("call tools refuse to run before call_start", async () => {
     assert.match(await b.tool("call_next", { wait_seconds: 5 }), /No call is open/);
     assert.match(await b.tool("call_say", { text: "hi" }), /No call is open/);
     assert.match(await b.tool("call_confirm", { action: "rm -rf x", why: "clean" }), /No call is open/);
+    assert.match(await b.tool("call_instruct", { text: "listening mode" }), /No call is open/);
   } finally { b.stop(); }
+});
+
+test("call_instruct pushes a redacted instruction, never a spoken answer, and closes no request", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor((f) => f.type === "hello");
+    await page.post("typed", { text: "let me dictate, don't interrupt" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight
+    const out = await b.tool("call_instruct", { text: "You are now in **listening mode**. Key sk-abcdefghijklmnopqrstuvwxyz123456" });
+    assert.match(out, /Instruction sent to the voice/);
+    const ins = await events.waitFor((f) => f.type === "instruct");
+    assert.match(ins.text, /^You are now in listening mode\./);
+    assert.doesNotMatch(ins.text, /sk-abc/);
+    assert.match(ins.text, /\[secret removed\]/);
+    assert.ok(!events.frames.some((f) => f.type === "say"), "nothing is spoken");
+    assert.deepEqual(JSON.parse(await b.tool("call_status")).inFlight.map((r) => r.id), ["r1"], "the request stays open");
+    assert.match(await b.tool("call_instruct", { text: "" }), /Nothing to send/);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("the voice briefing defines listening mode as opt-in", async () => {
+  const oa = await mockOpenAI();
+  const { b, page } = await started({ TTC_OPENAI_BASE: oa.base, TTC_OPENAI_API_KEY: KEY });
+  try {
+    await page.post("live", { sdp: "v=0 offer" });
+    const sent = JSON.parse(oa.seen.find((s) => s.url === "/v1/live/sessions").body);
+    assert.match(sent.session.instructions, /only when you are told you are in listening mode/);
+    assert.match(sent.session.instructions, /Never enter it on your own/);
+    assert.equal(sent.session.turn_detection, undefined, "default turn-taking is untouched");
+  } finally { b.stop(); oa.close(); }
 });
 
 test("call_start never prints a reusable secret: only a one-time link and the port", async () => {

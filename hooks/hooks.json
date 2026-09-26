@@ -3,7 +3,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^mcp__plugin_kivi-talk_voice__call_(start|next|say|confirm|end|status)$",
+        "matcher": "^mcp__plugin_kivi-talk_voice__call_(start|next|say|instruct|confirm|end|status)$",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" allow \"${CLAUDE_PLUGIN_DATA}\"" }
         ]

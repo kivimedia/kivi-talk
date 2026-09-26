@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -388,6 +388,7 @@ export function voiceInstructions(focus) {
     "- If Claude asks the user something or asks them to confirm an action, ask it clearly, then hand their reply to Claude.",
     "- Never read out a password, API key, token or other secret, even if an answer contains one.",
     "- Keep every reply short. This is a spoken conversation.",
+    "- Listening mode: only when you are told you are in listening mode, do not delegate or reply on a pause alone, however long; the user is dictating and pauses to think. Stay silent until an explicit stop cue (\"go ahead\", \"that's it\", \"over to you\", or a direct question to you), then treat everything said since entering the mode as one turn. Leave the mode after a stop cue or when told to resume normally. Never enter it on your own.",
     LANGUAGE ? `- Speak ${LANGUAGE}.` : "- Reply in the language the user speaks.",
     focus ? `\nThe user started this call to work on: ${focus}` : "",
   ].join("\n").trim();
@@ -934,6 +935,17 @@ export const TOOLS = [
     },
   },
   {
+    name: "call_instruct",
+    description: "Change how the voice model behaves for the rest of the call, without speaking. The text is appended to the voice's live instructions. Use it to enter listening mode when the user wants to dictate without being interrupted (for example: \"You are now in listening mode.\"), and again to leave it (\"Listening mode is over. Resume normal back-and-forth.\"). Never a secret.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The instruction for the voice model, one or two plain sentences." },
+      },
+      required: ["text"],
+    },
+  },
+  {
     name: "call_end",
     description: "Hang up the voice call (for example when the user asks you to). The page closes the OpenAI session.",
     inputSchema: { type: "object", properties: { reason: { type: "string" } } },
@@ -1055,6 +1067,21 @@ async function toolCall(name, args, ctx) {
     return text(delivered
       ? `Sent to the call${r ? ` as the ${final ? "answer to" : "progress on"} ${r.id}` : ""}. Now call call_next.`
       : "The call page is reconnecting; this will be spoken when it is back. Now call call_next.");
+  }
+
+  if (name === "call_instruct") {
+    if (!call) return fail("No call is open.");
+    const c = call;
+    c.lastLoopAt = Date.now();
+    if (!isOpen(c)) return text("The call has already ended, so the instruction was not sent.");
+    // Never spoken, but it still leaves this process for OpenAI, so it gets the same scrubbing.
+    const said = fitSpoken(speakable(args.text));
+    if (!said) return fail("Nothing to send: text was empty after removing markdown.");
+    const delivered = push({ type: "instruct", text: said });
+    remember(c, "system", "instruction to the voice: " + said);
+    return text(delivered
+      ? "Instruction sent to the voice. Now call call_next."
+      : "The call page is reconnecting; the instruction will be sent when it is back. Now call call_next.");
   }
 
   if (name === "call_end") {

@@ -100,9 +100,9 @@ async function main() {
   const sid = input.session_id;
 
   if (mode === "allow") {
-    /* The matcher is the first gate; this is the second. Only these exact six tools, so a tool
+    /* The matcher is the first gate; this is the second. Only these exact seven tools, so a tool
        from some other MCP server whose name merely CONTAINS ours is never approved here. */
-    const OURS = /^mcp__plugin_kivi-talk_voice__call_(start|next|say|confirm|end|status)$/;
+    const OURS = /^mcp__plugin_kivi-talk_voice__call_(start|next|say|instruct|confirm|end|status)$/;
     if (!OURS.test(String(input.tool_name || ""))) return;
     out({
       hookSpecificOutput: {
