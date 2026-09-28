@@ -4,6 +4,9 @@
   "description": "Kivi Talk: talk out loud to the Claude Code session you are in. The voice is powered by OpenAI GPT-Live on your own OpenAI key; your session does the work with its own tools while you talk. Type /talk.",
   "author": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
   "repository": "https://github.com/kivimedia/kivi-talk",
+  "homepage": "https://github.com/kivimedia/kivi-talk#readme",
+  "supportUrl": "https://github.com/kivimedia/kivi-talk/issues",
+  "privacyPolicyUrl": "https://github.com/kivimedia/kivi-talk/blob/main/SECURITY.md",
   "license": "Apache-2.0",
   "keywords": ["voice", "speech", "hands-free", "talk", "call"],
   "userConfig": {
