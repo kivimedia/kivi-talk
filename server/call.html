@@ -13,6 +13,9 @@
   --go: #0f766e; --go-text: #ffffff; --stop: #b91c1c; --stop-text: #ffffff;
   --you: #1d4ed8; --voice: #6d28d9; --claude: #0f766e; --err: #b91c1c; --note: #92400e;
   --field: #ffffff;
+  --link: #1d4ed8; --code-bg: #f1f5f9; --code-bar: #e2e8f0; --warn-bg: #fffbeb;
+  --add-bg: #dcfce7; --add-text: #14532d; --del-bg: #fee2e2; --del-text: #7f1d1d;
+  --overlay: rgba(15, 23, 42, 0.55);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -20,6 +23,9 @@
     --go: #14b8a6; --go-text: #04201d; --stop: #ef4444; --stop-text: #1f0505;
     --you: #93c5fd; --voice: #c4b5fd; --claude: #5eead4; --err: #fca5a5; --note: #fcd34d;
     --field: #0e151e;
+    --link: #93c5fd; --code-bg: #0b121b; --code-bar: #1b2633; --warn-bg: #2a1f06;
+    --add-bg: #0f2e1d; --add-text: #86efac; --del-bg: #3a1212; --del-text: #fecaca;
+    --overlay: rgba(0, 0, 0, 0.65);
   }
 }
 * { box-sizing: border-box; }
@@ -69,6 +75,78 @@ input[type=text], input[type=password] {
   max-height: 40vh; overflow-y: auto;
 }
 footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
+button.small { padding: 6px 10px; font-size: 14px; }
+
+/* Claude is waiting on a permission prompt in its own window: the call cannot answer it. */
+#permBox { border: 2px solid var(--note); background: var(--warn-bg); }
+#permBox p { margin: 0 0 8px; overflow-wrap: anywhere; }
+
+/* The requests Claude has open, each with its own Stop. */
+#reqs { list-style: none; margin: 10px 0 0; padding: 0; }
+#reqs > li { padding: 8px 0; border-top: 1px solid var(--line); }
+.req-top { display: flex; align-items: center; gap: 10px; }
+.req-label { flex: 1; min-width: 0; font-size: 14px; overflow-wrap: anywhere; }
+.req-top button { flex: none; }
+.req-now { margin: 4px 0 0; font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
+.req-steps { margin-top: 4px; font-size: 14px; color: var(--muted); }
+.req-steps summary { cursor: pointer; }
+.req-steps ol { margin: 4px 0 0; padding-inline-start: 22px; max-height: 30vh; overflow-y: auto; overflow-wrap: anywhere; }
+
+/* On screen: what Claude showed instead of reading it out. */
+.screen-head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
+.screen-head h2 { margin: 0; }
+.screen-nav { margin-top: 10px; gap: 8px; }
+#screenBody { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); max-height: 70vh; overflow: auto; overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md .code, .md .tablewrap, .md hr { margin: 0 0 12px; }
+.md h3, .md h4, .md h5, .md h6 { margin: 18px 0 8px; line-height: 1.3; }
+.md h3 { font-size: 20px; }
+.md h4 { font-size: 18px; }
+.md h5 { font-size: 16px; }
+.md h6 { font-size: 15px; }
+.md ul, .md ol { padding-inline-start: 24px; }
+.md li > p { margin: 0; }
+.md li > p + p, .md li > ul, .md li > ol, .md li > .code { margin-top: 4px; margin-bottom: 0; }
+.md blockquote { padding: 2px 12px; border-inline-start: 4px solid var(--line); color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--line); }
+.md a { color: var(--link); }
+.md code { font: 14px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; background: var(--code-bg); border-radius: 4px; padding: 1px 4px; }
+.md .code { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.code-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 4px 12px; background: var(--code-bar); border-bottom: 1px solid var(--line); }
+.code-lang { color: var(--muted); font-size: 13px; }
+.md pre { margin: 0; padding: 10px 12px; overflow-x: auto; background: var(--code-bg); }
+.md pre code { display: inline-block; min-width: 100%; padding: 0; border-radius: 0; background: none; white-space: pre; overflow-wrap: normal; }
+.d-add, .d-del, .d-hunk, .d-meta, .d-line { display: block; min-height: 1.45em; }
+.d-add { background: var(--add-bg); color: var(--add-text); }
+.d-del { background: var(--del-bg); color: var(--del-text); }
+.d-hunk { color: var(--voice); }
+.d-meta { font-weight: 700; }
+.tablewrap { max-width: 100%; overflow-x: auto; }
+.md table { border-collapse: collapse; font-size: 15px; }
+.md th, .md td { border: 1px solid var(--line); padding: 6px 10px; text-align: start; vertical-align: top; overflow-wrap: normal; }
+.md th { background: var(--code-bar); }
+.md img { max-width: 100%; }
+.files { display: grid; gap: 12px; }
+.md + .files { margin-top: 4px; }
+.files figure { margin: 0; }
+.files img { display: block; width: 100%; max-height: 60vh; object-fit: contain; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; }
+.files figcaption { margin-top: 4px; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+.file-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--field); }
+.file-name { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.file-size { color: var(--muted); }
+.files a { color: var(--link); font-weight: 600; }
+#log .show { margin-inline-start: 8px; padding: 4px 10px; font-size: 13px; }
+
+/* Files the user is sharing with Claude, before they go with a request. */
+#chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.chip { display: flex; align-items: center; gap: 8px; max-width: 100%; padding: 4px 4px 4px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--field); color: var(--text); font-size: 14px; }
+.chip-text { min-width: 0; overflow-wrap: anywhere; }
+.chip.up .chip-text { color: var(--muted); }
+.chip button { flex: none; padding: 4px 10px; font-size: 13px; }
+#attachNote { margin: 8px 0 0; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+#dropZone { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--overlay); pointer-events: none; }
+#dropZone p { margin: 0; padding: 22px 26px; border: 3px dashed var(--go); border-radius: 12px; background: var(--card); color: var(--text); font-size: 20px; font-weight: 600; text-align: center; }
+.offscreen { position: fixed; top: 0; left: -10000px; opacity: 0; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -79,7 +157,14 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     <span id="project"></span>
   </header>
 
-  <section class="card" aria-labelledby="status">
+  <section class="card" id="permBox" role="alert" hidden>
+    <h2>Claude is waiting for your approval in its own window</h2>
+    <p id="permText"></p>
+    <p>The call cannot approve this. Switch to the Claude window to allow or deny it.</p>
+    <button id="permHide" class="plain small" type="button">Hide this</button>
+  </section>
+
+  <section class="card" id="statusBox" aria-labelledby="status">
     <p id="status" role="status" aria-live="polite">Ready.</p>
     <p id="detail"></p>
     <div class="row">
@@ -88,6 +173,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       <span class="meter"><span id="clock">0:00</span> live · about <span id="cost">$0.00</span> · <span id="model"></span></span>
     </div>
     <p id="claudeLine"></p>
+    <ol id="reqs" aria-label="Requests Claude has open" hidden></ol>
   </section>
 
   <section class="card" id="confirmBox" hidden aria-live="assertive">
@@ -101,6 +187,21 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     </div>
   </section>
 
+  <section class="card" id="screenBox" aria-labelledby="screenTitle" hidden>
+    <div class="screen-head">
+      <h2 id="screenTitle">On screen</h2>
+      <span class="meter" id="screenMeta"></span>
+    </div>
+    <div class="row screen-nav">
+      <button id="screenPrev" class="plain small" type="button">Previous</button>
+      <span class="meter" id="screenPos"></span>
+      <button id="screenNext" class="plain small" type="button">Next</button>
+      <button id="screenCopy" class="plain small" type="button">Copy</button>
+      <span class="meter" id="screenCopied" role="status" aria-live="polite"></span>
+    </div>
+    <div id="screenBody" tabindex="0" aria-label="What Claude put on screen"></div>
+  </section>
+
   <section class="card" id="keyBox" hidden>
     <h2>Your OpenAI API key</h2>
     <p>The voice runs on OpenAI gpt-live-1, billed to your own OpenAI account (about $<span id="price">0.05</span> a minute while a call is live).</p>
@@ -112,22 +213,27 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     <p id="keyMsg" role="status" aria-live="polite"></p>
   </section>
 
-  <section class="card">
+  <section class="card" id="convoBox">
     <h2>Conversation</h2>
     <p id="interim"></p>
     <ol id="log"></ol>
+    <div id="chips" aria-label="Files you are sharing with Claude" hidden></div>
+    <p id="attachNote" hidden></p>
     <form class="inline" id="typeForm" autocomplete="off">
       <input id="typed" type="text" placeholder="Or type a request for Claude" aria-label="Type a request for Claude">
-      <button type="submit">Send</button>
+      <button id="attach" class="plain" type="button" aria-label="Attach files for Claude">Attach</button>
+      <button id="send" type="submit">Send</button>
+      <input id="fileInput" type="file" multiple hidden>
     </form>
   </section>
 
   <footer>
     <span id="keyLine"></span>
     <button class="plain" id="changeKey" type="button">Change key</button>
-    <p>Your voice goes to OpenAI to be heard and spoken. Claude does the work on this computer; only what it says out loud goes back to OpenAI.</p>
+    <p>Your voice goes to OpenAI to be heard and spoken. Claude does the work on this computer; only what it says out loud goes back to OpenAI. What Claude shows on screen and the files you share stay on this computer.</p>
   </footer>
 </main>
+<div id="dropZone" hidden><p>Drop files to share them with Claude</p></div>
 
 <script type="application/json" id="cfg">__CONFIG__</script>
 <script nonce="__NONCE__">
@@ -148,6 +254,9 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   var claude = { claude: CFG.claude || "away", queue: CFG.queue || 0, on: CFG.on || "" };
   var workingSince = 0;
   var sseDownSince = 0, seq = 0;
+  var endSeen = false;       // the bridge said the call is over (frames after that are the wind-down)
+  var frameN = 0, endFrameN = -1;   // frames from the bridge, counted (see onAttachments)
+  var cancelledAt = 0;       // the user's last spoken "stop" (see onDelegation)
 
   /* A caller can only trust a status line that says exactly what is happening now. */
   function setStatus(main, detail) {
@@ -162,6 +271,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     b.className = "who";
     b.textContent = who;
     var t = document.createElement("span");
+    t.className = "text";
     t.textContent = text;
     li.appendChild(b);
     li.appendChild(t);
@@ -169,6 +279,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     var atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
     log.appendChild(li);
     if (atBottom) log.scrollTop = log.scrollHeight;
+    return li;
   }
 
   function showInterim(who, text) { $("interim").textContent = who + ": " + text; }
@@ -200,6 +311,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     else if (phase === "closing") { go.textContent = "Hanging up..."; go.disabled = true; }
     else { go.textContent = "Call ended"; go.disabled = true; }
     $("mute").hidden = phase !== "live";
+    $("attach").disabled = phase === "ended";
 
     $("project").textContent = CFG.project ? "in " + CFG.project + (CFG.focus ? " · " + CFG.focus : "") : "";
     $("model").textContent = CFG.model;
@@ -239,11 +351,16 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   }
 
   function onServer(m) {
+    frameN++;
     if (m.type === "hello") {
       ["keyPresent", "keySource", "keyHint", "configFile", "model", "project", "focus",
        "idleMinutes", "maxMinutes", "pricePerMinute"].forEach(function (k) { if (k in m) CFG[k] = m[k]; });
       claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
+      if (Array.isArray(m.items)) setItems(m.items);
+      restoreActivity(m.activity);
+      if (Array.isArray(m.pending)) onAttachments(m.pending);
       if (m.state === "ended") {
+        endSeen = true;
         if (phase === "live" || phase === "connecting") hangUp("Claude ended the call.");
         else if (phase !== "ended") { phase = "ended"; setStatus("This call has ended.", (m.endReason || "") + " Run /talk in Claude to call again."); }
       }
@@ -253,20 +370,43 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     if (m.type === "status") {
       if (m.claude === "working" && claude.claude !== "working") workingSince = Date.now();
       claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
+      if (Array.isArray(m.items)) setItems(m.items);
       renderClaude();
       return;
     }
     if (m.type === "working") {
       lastActivity = Date.now();
       workingSince = Date.now();
-      addLine("Claude", "working on “" + m.text + "”", "work");
+      hidePerm();
+      var withFiles = m.files ? " with " + m.files + " file(s) you shared" : "";
+      addLine("Claude", "working on “" + m.text + "”" + withFiles, "work");
       if (phase === "live") setStatus("Claude is working.", m.text);
       // Quiet context, not speech: the voice knows Claude has started if the user asks.
-      thinking(lastOf(m.delegationIds), "Claude has started working on: " + m.text + ". No result yet.");
+      thinking(lastOf(m.delegationIds), "Claude has started working on: " + m.text + ". No result yet."
+        + (m.files ? " The user shared " + m.files + " file(s) with this request." : ""));
       return;
     }
     if (m.type === "say") { claudeResponded(); onSay(m); return; }
+    if (m.type === "attachments") { onAttachments(m.pending || []); return; }
+    if (m.type === "cancelled") {
+      hidePerm();
+      // The Requests list still has it (the status frame follows this one), so it can say what went with it.
+      var dropped = rows[m.id] ? rows[m.id].it : null;
+      addLine("Call", m.was === "queued"
+        ? "took " + m.id + " out of the queue; Claude never started it"
+          + (dropped && dropped.files ? ". The " + dropped.files + " file(s) with it were not sent; Claude gets them in the end-of-call hand-off" : "")
+        : "stopping " + m.id + ": Claude is told at its next step", "note");
+      return;
+    }
+    if (m.type === "activity") {
+      /* The step that needs the approval posts its own line at about the same moment as the
+         notice, in either order: only a later step means Claude moved on. */
+      if (Date.now() - permShownAt > PERM_GRACE_MS) hidePerm();
+      onActivity(m);
+      return;
+    }
     if (m.type === "instruct") {
+      hidePerm();
       // Not speech: it changes how the voice behaves (listening mode) for the rest of the call.
       addLine("Call", "Claude told the voice: " + m.text, "note");
       if (m.mode === "listening") listening = true;
@@ -284,10 +424,19 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     }
     if (m.type === "notify") {
       addLine("Notice", m.text, "note");
+      if (m.kind === "permission") {
+        showPerm(m.text);
+        if (phase === "live") setStatus("Claude is waiting for your approval in its own window.", "The call cannot approve this. Switch to the Claude window to allow or deny it.");
+        commentary(null, "Tell the user this, briefly: " + m.text + ". The call cannot approve it; they have to switch to the Claude window.");
+        return;
+      }
+      if (m.kind === "stopped" && phase === "live") setStatus("Claude stopped listening on the call.", m.text);
       commentary(null, "Tell the user this, briefly: " + m.text);
       return;
     }
     if (m.type === "end") {
+      endSeen = true;
+      endFrameN = frameN;
       var why = m.reason || "Claude ended the call.";
       // Let the goodbye Claude just sent finish playing before the line goes dead.
       if (phase === "live") { setStatus("Hanging up...", why); setTimeout(function () { hangUp(why); }, 3500); }
@@ -303,11 +452,17 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
      under the id of the request they belong to. Typed requests have none and go out as null. */
   function onSay(m) {
     lastActivity = Date.now();
+    hidePerm();
     // Any question in the answer (or "there is more"): a bare "ok" after it is a reply, not small talk.
     if (m.final) claudeAsked = /[?？]|ask if you want the rest\.$/.test(m.text);
     flushSaid();   // whatever the voice said before this answer belongs above it
-    addLine("Claude", m.text, m.final ? "claude" : "progress");
-    if (phase === "live") setStatus(m.final ? "Claude answered." : "Claude is still working.", m.text);
+    var shown = (typeof m.display === "string" && m.display) || (Array.isArray(m.files) && m.files.length) ? addScreen(m) : null;
+    var li = addLine("Claude", m.text, m.final ? "claude" : "progress");
+    if (shown) addShowButton(li, shown);
+    if (phase === "live") setStatus(m.final ? "Claude answered." : "Claude is still working.", m.text + (shown ? " (details on screen)" : ""));
+    /* The voice only learns THAT something is on screen, never what: display text and files stay
+       on this computer. Said before the answer, so the voice can point the user at the page. */
+    if (shown) thinking(lastOf(m.delegationIds), "Claude also put details on the user's screen, on the call page.");
     /* Closed quietly: the voice already answered this well by itself. It is told, so it knows,
        but nothing is said twice. A request the voice itself delegated still gets its answer. */
     if (m.quiet && !(m.delegationIds && m.delegationIds.length)) {
@@ -509,11 +664,59 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
      goodbye!"), so "don't hang up yet" or "say bye to the old API" never end the call. */
   var HANGUP = /^\s*(?:(?:ok(?:ay)?|thanks?|thank you|great|perfect|all ?right|alright|cool|תודה(?: רבה)?|אוקיי?|סבבה|יופי|טוב)[,.!]?\s*)*(?:please[,]?\s+)?(?:hang up|end (?:the|this) call|bye(?:[- ]bye)?|good ?bye|ביי(?:[- ]ביי)?|להתראות|יאללה ביי|תנתק|נתק|לנתק|סיים את השיחה)(?:[,.!]?\s*(?:claude|now|for now|please|thanks|thank you|then|קלוד|תודה))*[\s.!]*$/i;
 
+  /* The whole utterance has to be a cancel ("Stop.", "OK, cancel that.", "עזוב, לא משנה"), so
+     "stop the deploy" or "don't stop" are requests like any other and go to Claude. */
+  var CANCEL_WORD = "(?:stop(?:\\s+(?:it|that|this))?|cancel(?:\\s+(?:it|that|this))?|never ?mind|forget (?:it|that)|scratch that|עצור|תעצור|תפסיק|בטל|תבטל|לבטל|עזוב|לא משנה)(?:\\s+(?:את זה|זה))?";
+  var CANCEL = new RegExp("^\\s*(?:(?:no|ok(?:ay)?|wait|hey|claude|please|לא|רגע|קלוד)[,.!]?\\s+)*" + CANCEL_WORD
+    + "(?:[,.!]?\\s*" + CANCEL_WORD + ")*(?:[,.!]?\\s*(?:claude|please|now|thanks|thank you|קלוד|בבקשה|עכשיו|תודה))*[\\s.!]*$", "i");
+
+  /* A spoken cancel is acted on here, by the page, the moment it is heard: it never goes to
+     Claude as a request (Claude would only get it after the work it is meant to stop). The newest
+     queued request goes first, since it has not started; otherwise the newest one Claude is on. */
+  function spokenCancel(t) {
+    if (phase !== "live" || listening || !items.length || !CANCEL.test(t)) return false;
+    var target = newestItem("queued") || newestItem("working");
+    cancelledAt = Date.now();
+    /* Not posted as a user line either: the bridge records the cancel itself, and a bare "stop"
+       in the end-of-call hand-off would read as something the user still wants done. */
+    addLine("You", t, "you");
+    recent.push({ role: "user", text: t });
+    if (recent.length > 24) recent.shift();
+    if (!target) {
+      // Everything open is already stopping. Saying it again is not a new request for Claude.
+      var s = newestItem("stopping");
+      addLine("Call", "you said stop; " + s.id + " is already stopping", "note");
+      setStatus("Stopping " + s.id + "...", "Claude stops at its next step and says what, if anything, was already changed.");
+      commentary(null, "The user cancelled Claude's request. Say only: Cancelled.");
+      return true;
+    }
+    addLine("Call", "you said stop, so the page is stopping " + target.id, "note");
+    setStatus("Stopping " + target.id + "...", "You said “" + t + "”.");
+    api("/cancel", { id: target.id }).then(function (r) {
+      if (!r.ok) {
+        addLine("Error", target.id + " could not be stopped: it had already finished.", "err");
+        commentary(null, "Tell the user, briefly: Claude had already finished that, so there was nothing to stop.");
+        return;
+      }
+      commentary(null, "The user cancelled Claude's request. Say only: Cancelled.");
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (phase !== "live") return;
+        var queued = (j.was || target.state) === "queued";
+        setStatus(queued ? "Took " + target.id + " out of the queue." : "Stopping " + target.id + ".",
+          queued ? "Claude never started it." : "Claude stops at its next step and says what, if anything, was already changed.");
+      });
+    }).catch(function (e) {
+      addLine("Error", "Could not stop " + target.id + ": " + String((e && e.message) || e), "err");
+    });
+    return true;
+  }
+
   function flushHeard() {
     var t = heardBuf.trim();
     heardBuf = "";
     if (!t) return;
     clearInterim();
+    if (spokenCancel(t)) return;
     addLine("You", t, "you");
     recent.push({ role: "user", text: t });
     if (recent.length > 24) recent.shift();
@@ -585,6 +788,14 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       await userQuiet(1000, 5000);
       flushHeard();
       flushSaid();
+      /* The voice often delegates the user's "stop" itself. The page has already stopped the
+         work, and an empty hand-over would only come back as "say it again". An "ok" or a second
+         "stop" around it is nothing new either. */
+      if (Date.now() - cancelledAt < 6000 && sinceHandover.every(function (t) { return SMALLTALK.test(t) || CANCEL.test(t); })) {
+        sinceHandover.splice(0);
+        commentary(id, "That was the user cancelling; it is done. Say only: Cancelled.");
+        return;
+      }
       await handOver(id, sinceHandover.splice(0), "voice");
     } finally { delegating--; }
   }
@@ -635,7 +846,8 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       overhearTimer = setTimeout(overhear, 1500);
       return;
     }
-    var chat = !claudeAsked && sinceHandover.every(function (t) { return SMALLTALK.test(t) || HANGUP.test(t); });
+    // A bare "stop" with nothing of Claude's running is for the voice (stop talking), not a request.
+    var chat = !claudeAsked && sinceHandover.every(function (t) { return SMALLTALK.test(t) || HANGUP.test(t) || CANCEL.test(t); });
     var said = sinceHandover.splice(0);
     if (chat) return;
     addLine("Call", "the voice did not pass that on, so it went to Claude directly", "note");
@@ -719,6 +931,8 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     muted = false;
     var wasLive = Boolean(startedAt);
     phase = "ended";
+    endAttachments();
+    setItems([]);
     render();
     var took = wasLive ? Date.now() - startedAt : 0;
     setStatus("Call ended.", reason + (wasLive ? " " + mmss(took) + " live, about $" + (took / 60000 * CFG.pricePerMinute).toFixed(2) + "." : "") + " Run /talk in Claude to call again.");
@@ -765,6 +979,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       if (sseDownSince && now - sseDownSince > 15000) hangUp("Lost contact with the Claude session (it may have closed).");
     }
     if (claude.claude === "working") renderClaude();
+    tickItems();
   }, 1000);
 
   /* ------------------------------------------------------ confirmation -- */
@@ -841,6 +1056,868 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     api("/mute", { muted: on }).catch(noop);
   }
 
+  /* ---------------------------------------------------------- markdown -- */
+
+  /* What Claude shows instead of reading out: code, links, tables, pictures. It is markdown from
+     this computer, shown only here and never sent to OpenAI, but it is still untrusted text (it
+     can quote a web page or a file). So nothing here ever parses HTML: elements are created and
+     text is set, raw HTML in the markdown shows as text, attributes come from a fixed list, and
+     only http, https and mailto links are live. */
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  // A Hebrew paragraph reads right to left, an English one left to right, in the same answer.
+  function block(parent, tag) {
+    var e = parent.appendChild(el(tag));
+    e.setAttribute("dir", "auto");
+    return e;
+  }
+
+  function safeHref(u) {
+    u = String(u || "").trim();
+    if (!/^(?:https?:|mailto:)/i.test(u) || /[\s\u0000-\u001f\u007f]/.test(u)) return "";
+    try {
+      var p = new URL(u);
+      return /^(?:https?|mailto):$/.test(p.protocol) ? p.href : "";
+    } catch (e) { return ""; }
+  }
+
+  function outLink(href) {
+    var a = el("a");
+    a.setAttribute("href", href);
+    a.setAttribute("target", "_blank");
+    a.setAttribute("rel", "noopener noreferrer");
+    return a;
+  }
+
+  var MD_FENCE = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/;
+  var MD_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
+  var MD_HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+  var MD_QUOTE = /^ {0,3}>[ \t]?(.*)$/;
+  var MD_ITEM = /^( *)([-*+]|\d{1,9}[.)])(?:[ \t]+(.*)|$)/;
+  var MD_DELIM = /^ *\|? *:?-+:? *(?:\| *:?-+:? *)*\|? *$/;
+  var MD_ESC = /[!-\/:-@\[-`{-~]/;
+  var MD_URL = /(?:https?:\/\/|mailto:)[^\s<]+/iy;
+  var MD_AUTO = /<((?:https?:\/\/|mailto:)[^\s<>]+)>/iy;
+  // Every forward search is bounded, so a pathological 100,000-character answer cannot hang the page.
+  var MD_REACH = 4000;
+
+  function renderMarkdown(src, files) {
+    var root = el("div", "md");
+    blocks(String(src).replace(/\r\n?/g, "\n").split("\n"), root, { files: files || [], inLink: false }, 0);
+    return root;
+  }
+
+  function indentOf(l) { return /^ */.exec(l)[0].length; }
+
+  function startsBlock(lines, i) {
+    var l = lines[i];
+    return MD_FENCE.test(l) || MD_HEADING.test(l) || MD_HR.test(l) || MD_QUOTE.test(l) || MD_ITEM.test(l) || tableAt(lines, i);
+  }
+
+  function blocks(lines, parent, ctx, depth) {
+    if (depth > 20) { block(parent, "p").textContent = lines.join("\n"); return; }
+    var i = 0, m;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!line.trim()) { i++; continue; }
+      if ((m = MD_FENCE.exec(line))) { i = fenced(lines, i, m, parent); continue; }
+      if ((m = MD_HEADING.exec(line))) {
+        // The card's own title is an h2, so markdown's levels start below it.
+        inline(m[2] || "", block(parent, "h" + Math.min(6, m[1].length + 2)), ctx, 0);
+        i++;
+        continue;
+      }
+      if (MD_HR.test(line)) { parent.appendChild(el("hr")); i++; continue; }
+      if (MD_QUOTE.test(line)) { i = quote(lines, i, parent, ctx, depth); continue; }
+      if (MD_ITEM.test(line)) { i = list(lines, i, parent, ctx, depth); continue; }
+      if (tableAt(lines, i)) { i = table(lines, i, parent, ctx); continue; }
+      // A paragraph keeps its line breaks: an address or a short list without markers stays readable.
+      var p = block(parent, "p");
+      for (var first = true; i < lines.length && lines[i].trim() && (first || !startsBlock(lines, i)); i++, first = false) {
+        if (!first) p.appendChild(el("br"));
+        inline(lines[i].trim(), p, ctx, 0);
+      }
+    }
+  }
+
+  function fenced(lines, i, m, parent) {
+    var fence = m[1], body = [];
+    var close = new RegExp("^ {0,3}" + fence[0] + "{" + fence.length + ",}[ \\t]*$");
+    for (i++; i < lines.length && !close.test(lines[i]); i++) body.push(lines[i]);
+    parent.appendChild(codeBox(body.join("\n"), m[2] || ""));
+    return i + 1;   // past the closing fence (an unclosed block runs to the end)
+  }
+
+  function codeBox(code, lang) {
+    var box = el("div", "code");
+    var bar = box.appendChild(el("div", "code-bar"));
+    bar.appendChild(el("span", "code-lang", lang ? lang.slice(0, 40) : "code"));
+    var copy = bar.appendChild(el("button", "plain small", "Copy"));
+    copy.type = "button";
+    copy.setAttribute("aria-label", "Copy this " + (lang ? lang.slice(0, 40) + " " : "") + "code");
+    copy.addEventListener("click", function () { copyText(code, copy); });
+    var pre = box.appendChild(el("pre"));
+    pre.setAttribute("dir", "ltr");        // code reads left to right, even inside a Hebrew answer
+    pre.setAttribute("tabindex", "0");     // a long line scrolls sideways inside the box, by keyboard too
+    var c = pre.appendChild(el("code"));
+    if (/^(?:diff|patch)$/i.test(lang)) {
+      code.split("\n").forEach(function (l) {
+        var cls = /^(?:\+\+\+|---)(?: |$)/.test(l) ? "d-meta" : l[0] === "+" ? "d-add" : l[0] === "-" ? "d-del"
+          : l.indexOf("@@") === 0 ? "d-hunk" : "d-line";
+        c.appendChild(el("span", cls, l));
+      });
+    } else c.textContent = code;
+    return box;
+  }
+
+  function quote(lines, i, parent, ctx, depth) {
+    var inner = [], m;
+    for (; i < lines.length && lines[i].trim(); i++) {
+      if ((m = MD_QUOTE.exec(lines[i]))) inner.push(m[1]);
+      else if (startsBlock(lines, i)) break;
+      else inner.push(lines[i]);   // a lazy continuation of the quoted paragraph
+    }
+    blocks(inner, block(parent, "blockquote"), ctx, depth + 1);
+    return i;
+  }
+
+  /* Nesting follows indentation: a marker indented two or more spaces past the list's own is a
+     child of the item above it, anything less is the next sibling. */
+  function list(lines, i, parent, ctx, depth) {
+    var first = MD_ITEM.exec(lines[i]);
+    var base = first[1].length, ordered = /\d/.test(first[2]);
+    var box = block(parent, ordered ? "ol" : "ul");
+    if (ordered && parseInt(first[2], 10) !== 1) box.setAttribute("start", String(parseInt(first[2], 10)));
+    function sibling(k) {
+      var s = k < lines.length && MD_ITEM.exec(lines[k]);
+      return s && s[1].length <= base + 1 && /\d/.test(s[2]) === ordered ? s : null;
+    }
+    while (i < lines.length) {
+      if (!lines[i].trim()) {
+        // A blank line between two items keeps the list going; anything else after it ends it.
+        var n = i;
+        while (n < lines.length && !lines[n].trim()) n++;
+        if (!sibling(n)) break;
+        i = n;
+      }
+      var m = sibling(i);
+      if (!m) break;
+      var at = m[1].length + m[2].length + 1, body = [m[3] || ""];
+      for (i++; i < lines.length; i++) {
+        var l = lines[i], ind = indentOf(l);
+        if (!l.trim()) {
+          var k = i;
+          while (k < lines.length && !lines[k].trim()) k++;
+          if (k < lines.length && indentOf(lines[k]) >= base + 2) { body.push(""); continue; }
+          break;
+        }
+        if (ind >= base + 2) { body.push(l.slice(Math.min(ind, at))); continue; }
+        if (MD_ITEM.test(l) || startsBlock(lines, i)) break;
+        body.push(l.trim());   // a lazy continuation of the item's text
+      }
+      blocks(body, block(box, "li"), ctx, depth + 1);
+    }
+    return i;
+  }
+
+  function cells(line) {
+    var s = line.trim(), out = [], cur = "", code = false;
+    if (s[0] === "|") s = s.slice(1);
+    if (s.slice(-1) === "|" && s.slice(-2) !== "\\|") s = s.slice(0, -1);
+    for (var k = 0; k < s.length; k++) {
+      var ch = s[k];
+      if (ch === "\\" && s[k + 1] === "|") { cur += "|"; k++; continue; }
+      // A pipe inside `code` stays in the cell (only when the backtick really closes).
+      if (ch === "`" && (code || s.indexOf("`", k + 1) > 0)) code = !code;
+      if (ch === "|" && !code) { out.push(cur.trim()); cur = ""; continue; }
+      cur += ch;
+    }
+    out.push(cur.trim());
+    return out;
+  }
+
+  function tableAt(lines, i) {
+    if (i + 1 >= lines.length || lines[i].indexOf("|") < 0 || lines[i + 1].indexOf("-") < 0 || !MD_DELIM.test(lines[i + 1])) return false;
+    return cells(lines[i]).length === cells(lines[i + 1]).length;
+  }
+
+  function table(lines, i, parent, ctx) {
+    var head = cells(lines[i]);
+    var align = cells(lines[i + 1]).map(function (c) {
+      var l = c[0] === ":", r = c.slice(-1) === ":";
+      return l && r ? "center" : r ? "right" : l ? "left" : "";
+    });
+    // A table wider than the phone scrolls sideways inside its own box, never the page.
+    var wrap = el("div", "tablewrap");
+    wrap.setAttribute("tabindex", "0");
+    wrap.setAttribute("role", "region");
+    wrap.setAttribute("aria-label", "Table");
+    var t = block(wrap, "table"), tr = el("tr");
+    head.forEach(function (h, k) { tr.appendChild(cell("th", h, align[k], ctx)); });
+    t.appendChild(el("thead")).appendChild(tr);
+    var body = t.appendChild(el("tbody"));
+    for (i += 2; i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0; i++) {
+      var row = cells(lines[i]), r = el("tr");
+      for (var k = 0; k < head.length; k++) r.appendChild(cell("td", row[k] || "", align[k], ctx));
+      body.appendChild(r);
+    }
+    parent.appendChild(wrap);
+    return i;
+  }
+
+  function cell(tag, text, align, ctx) {
+    var c = el(tag);
+    c.setAttribute("dir", "auto");
+    if (tag === "th") c.setAttribute("scope", "col");
+    if (align) c.style.textAlign = align;
+    inline(text, c, ctx, 0);
+    return c;
+  }
+
+  function run(s, i, ch) {
+    var n = 0;
+    while (s[i + n] === ch) n++;
+    return n;
+  }
+
+  // Where a code span of exactly n backticks closes, or -1.
+  function closingRun(s, from, n) {
+    var stop = from + MD_REACH;
+    for (var j = s.indexOf("`", from); j >= 0 && j < stop; j = s.indexOf("`", j)) {
+      var r = run(s, j, "`");
+      if (r === n) return j;
+      j += r;
+    }
+    return -1;
+  }
+
+  // Past a code span starting at j (or past its lone backticks), for scans that must not look inside one.
+  function skipCode(s, j) {
+    var r = run(s, j, "`"), e = closingRun(s, j + r, r);
+    return (e < 0 ? j + r : e + r) - 1;
+  }
+
+  /* **bold**, __bold__, *italic*, _italic_, ~~struck~~. A delimiter opens only before a
+     non-space and closes only after one; _ inside a word (snake_case) is just a character. */
+  function emphAt(s, i) {
+    var ch = s[i], n = run(s, i, ch), d = n >= 2 ? 2 : 1;
+    if (ch === "~" && d !== 2) return null;
+    var from = i + d;
+    if (!s[from] || /\s/.test(s[from])) return null;
+    if (ch === "_" && i > 0 && /[\p{L}\p{N}]/u.test(s[i - 1])) return null;
+    for (var j = from, stop = from + MD_REACH; j < s.length && j < stop; j++) {
+      var c = s[j];
+      if (c === "\\") { j++; continue; }
+      if (c === "`") { j = skipCode(s, j); continue; }
+      if (c !== ch) continue;
+      var rl = run(s, j, ch), at = j + rl - d;   // the closer is the last d characters of the run
+      var ok = rl >= d && (d === 2 || rl === 1) && at > from && !/\s/.test(s[j - 1])
+        && !(ch === "_" && /[\p{L}\p{N}]/u.test(s[j + rl] || ""));
+      if (ok) return { tag: ch === "~" ? "del" : d === 2 ? "strong" : "em", inner: s.slice(from, at), end: j + rl };
+      j += rl - 1;
+    }
+    return null;
+  }
+
+  // [text](url "title") starting at the "[" at i, or null.
+  function linkAt(s, i) {
+    var depth = 0, j, stop = i + MD_REACH;
+    for (j = i; j < s.length && j < stop; j++) {
+      var c = s[j];
+      if (c === "\\") { j++; continue; }
+      if (c === "`") { j = skipCode(s, j); continue; }
+      if (c === "[") depth++;
+      else if (c === "]" && --depth === 0) break;
+    }
+    if (j >= s.length || j >= stop || s[j + 1] !== "(") return null;
+    var k = j + 2, url, par = 0;
+    while (s[k] === " ") k++;
+    if (s[k] === "<") {
+      var gt = s.indexOf(">", k);
+      if (gt < 0 || gt - k > MD_REACH) return null;
+      url = s.slice(k + 1, gt);
+      k = gt + 1;
+    } else {
+      var st = k;
+      for (; k < s.length && k - st < MD_REACH; k++) {
+        var ch = s[k];
+        if (ch === "\\") { k++; continue; }
+        if (ch === "(") par++;
+        else if (ch === ")") { if (!par) break; par--; }
+        else if (/\s/.test(ch)) break;
+      }
+      url = s.slice(st, k);
+    }
+    while (s[k] === " ") k++;
+    if (s[k] === '"' || s[k] === "'") {
+      var q = s.indexOf(s[k], k + 1);
+      if (q < 0 || q - k > MD_REACH) return null;
+      k = q + 1;
+      while (s[k] === " ") k++;
+    }
+    if (s[k] !== ")") return null;
+    return { text: s.slice(i + 1, j), url: url.replace(/\\(.)/g, "$1"), end: k + 1, raw: s.slice(i, k + 1) };
+  }
+
+  // A URL's closing punctuation belongs to the sentence: "see https://x.com/a." links x.com/a.
+  function trimUrl(u) {
+    for (;;) {
+      var last = u.slice(-1);
+      if (/[.,;:!?'"*_~]/.test(last)) u = u.slice(0, -1);
+      else if (last === ")" && u.split("(").length < u.split(")").length) u = u.slice(0, -1);
+      else return u;
+    }
+  }
+
+  /* A file Claude shared with this answer, named in the markdown by its name or by a path ending
+     in it. A web address is never one of them, even if its last part has the same name. */
+  function sharedFile(files, url) {
+    var u = String(url || "").trim();
+    try { u = decodeURIComponent(u); } catch (e) {}
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u) && !/^file:/i.test(u)) return null;
+    var base = u.split(/[\\/]/).pop();
+    for (var k = 0; k < files.length; k++) if (files[k].name === u || files[k].name === base) return files[k];
+    return null;
+  }
+
+  function fileUrl(f) { return BASE + "/file/" + encodeURIComponent(f.token); }
+
+  function link(L, parent, ctx, depth) {
+    var f = sharedFile(ctx.files, L.url);
+    var href = f ? fileUrl(f) : safeHref(L.url);
+    // javascript:, data:, a relative path: shown exactly as written, as text.
+    if (!href) { parent.appendChild(document.createTextNode(L.raw)); return; }
+    var a = parent.appendChild(outLink(href));
+    ctx.inLink = true;
+    inline(L.text, a, ctx, depth + 1);
+    ctx.inLink = false;
+  }
+
+  // Pictures load only from this call's own shared files: the page never fetches from the web.
+  function image(L, parent, ctx) {
+    var f = sharedFile(ctx.files, L.url), alt = L.text.replace(/\\(.)/g, "$1");
+    if (f && f.image) {
+      var img = el("img");
+      img.setAttribute("src", fileUrl(f));
+      img.setAttribute("alt", alt || f.name);
+      if (ctx.inLink) { parent.appendChild(img); return; }
+      var a = parent.appendChild(outLink(fileUrl(f)));
+      a.appendChild(img);
+      return;
+    }
+    var href = f ? fileUrl(f) : safeHref(L.url);
+    if (href && !ctx.inLink) { parent.appendChild(outLink(href)).textContent = alt || L.url; return; }
+    parent.appendChild(document.createTextNode(L.raw));
+  }
+
+  function inline(s, parent, ctx, depth) {
+    if (depth > 12) { parent.appendChild(document.createTextNode(s)); return; }
+    var buf = "", i = 0, m, L;
+    function flush() { if (buf) { parent.appendChild(document.createTextNode(buf)); buf = ""; } }
+    while (i < s.length) {
+      var ch = s[i];
+      if (ch === "\\" && MD_ESC.test(s[i + 1] || "")) { buf += s[i + 1]; i += 2; continue; }
+      if (ch === "`") {
+        var n = run(s, i, "`"), end = closingRun(s, i + n, n);
+        if (end < 0) { buf += s.slice(i, i + n); i += n; continue; }
+        var code = s.slice(i + n, end);
+        if (/^ .*[^ ].* $/.test(code)) code = code.slice(1, -1);
+        flush();
+        parent.appendChild(el("code", "", code));
+        i = end + n;
+        continue;
+      }
+      if (ch === "!" && s[i + 1] === "[" && (L = linkAt(s, i + 1))) { flush(); image(L, parent, ctx); i = L.end; continue; }
+      if (ch === "[" && !ctx.inLink && (L = linkAt(s, i))) { flush(); link(L, parent, ctx, depth); i = L.end; continue; }
+      if (ch === "<" && !ctx.inLink) {
+        MD_AUTO.lastIndex = i;
+        var auto = (m = MD_AUTO.exec(s)) && safeHref(m[1]);
+        if (auto) { flush(); parent.appendChild(outLink(auto)).textContent = m[1]; i += m[0].length; continue; }
+      }
+      if (!ctx.inLink && /[hm]/i.test(ch) && (i === 0 || /[\s(\[{"'*_~]/.test(s[i - 1]))) {
+        MD_URL.lastIndex = i;
+        var u = (m = MD_URL.exec(s)) && trimUrl(m[0]), bare = u && safeHref(u);
+        if (bare) { flush(); parent.appendChild(outLink(bare)).textContent = u; i += u.length; continue; }
+      }
+      if (ch === "*" || ch === "_" || ch === "~") {
+        var e = emphAt(s, i);
+        if (e) { flush(); inline(e.inner, parent.appendChild(el(e.tag)), ctx, depth + 1); i = e.end; continue; }
+        var r = run(s, i, ch);   // not emphasis: the whole run is text, so it cannot half-match later
+        buf += s.slice(i, i + r);
+        i += r;
+        continue;
+      }
+      buf += ch;
+      i++;
+    }
+    flush();
+  }
+
+  /* The clipboard API first; the old copy command when the browser refuses it. Either way the
+     button says what happened. */
+  function copyText(t, btn, note) {
+    function done(ok) {
+      btn.textContent = ok ? "Copied" : "Copy failed";
+      if (note) note.textContent = ok ? "Copied to the clipboard." : "The browser blocked the clipboard. Select the text and copy it instead.";
+      clearTimeout(btn.copyTimer);
+      btn.copyTimer = setTimeout(function () { btn.textContent = "Copy"; if (note) note.textContent = ""; }, 2000);
+    }
+    function fallback() {
+      var ta = document.body.appendChild(el("textarea", "offscreen"));
+      ta.value = t;
+      ta.setAttribute("readonly", "");
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      ta.remove();
+      btn.focus();
+      done(ok);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(function () { done(true); }, fallback);
+    else fallback();
+  }
+
+  /* --------------------------------------------------------- on screen -- */
+
+  var screens = [], screenAt = -1, screenSeq = 0;
+
+  function human(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+    return (n / 1048576).toFixed(1) + " MB";
+  }
+
+  function clockTime(ms, secs) {
+    try {
+      return new Date(ms).toLocaleTimeString([], secs ? { hour: "numeric", minute: "2-digit", second: "2-digit" } : { hour: "numeric", minute: "2-digit" });
+    } catch (e) { return ""; }
+  }
+
+  // The card keeps the last 50 things Claude showed and opens on the newest.
+  function addScreen(m) {
+    var entry = {
+      n: ++screenSeq, id: m.id || null, final: Boolean(m.final), at: Date.now(),
+      display: typeof m.display === "string" ? m.display : "",
+      files: Array.isArray(m.files) ? m.files.filter(function (f) { return f && f.token; }) : [],
+    };
+    screens.push(entry);
+    if (screens.length > 50) screens.shift();
+    showScreen(screens.length - 1);
+    return entry;
+  }
+
+  function showScreen(k) {
+    if (k < 0 || k >= screens.length) return;
+    screenAt = k;
+    var e = screens[k];
+    $("screenBox").hidden = false;
+    var what = e.id ? (e.final ? "answer to " : "progress on ") + e.id : (e.final ? "from Claude" : "progress note from Claude");
+    $("screenMeta").textContent = what + " · " + clockTime(e.at);
+    $("screenPos").textContent = (k + 1) + " of " + screens.length;
+    $("screenPrev").disabled = k === 0;
+    $("screenNext").disabled = k === screens.length - 1;
+    $("screenCopy").hidden = !e.display;
+    $("screenCopy").textContent = "Copy";
+    $("screenCopied").textContent = "";
+    var body = $("screenBody");
+    body.textContent = "";
+    if (e.display) body.appendChild(renderMarkdown(e.display, e.files));
+    if (e.files.length) body.appendChild(fileList(e.files));
+    body.scrollTop = 0;
+  }
+
+  function addShowButton(li, entry) {
+    var b = li.appendChild(el("button", "plain small show", "Show on screen"));
+    b.type = "button";
+    b.setAttribute("aria-label", "Show what Claude put on screen" + (entry.id ? " for " + entry.id : ""));
+    b.addEventListener("click", function () {
+      for (var k = 0; k < screens.length; k++) {
+        if (screens[k].n !== entry.n) continue;
+        showScreen(k);
+        $("screenBox").scrollIntoView({ block: "start", behavior: "smooth" });
+        return;
+      }
+      b.disabled = true;
+      b.textContent = "No longer kept (the card keeps the last 50)";
+    });
+  }
+
+  /* Files Claude shared: pictures as thumbnails, anything else as a row to open. Both open in a
+     new tab, served by the bridge in a sandbox, so a shared page or SVG cannot run anything. */
+  function fileList(files) {
+    var box = el("div", "files");
+    files.forEach(function (f) {
+      var url = fileUrl(f), size = human(f.size);
+      if (f.image) {
+        var fig = box.appendChild(el("figure"));
+        var a = fig.appendChild(outLink(url));
+        a.setAttribute("aria-label", "Open " + f.name + " full size in a new tab");
+        var img = a.appendChild(el("img"));
+        img.setAttribute("src", url);
+        img.setAttribute("alt", f.name);
+        var cap = fig.appendChild(el("figcaption", "", f.name + " · " + size));
+        cap.setAttribute("dir", "auto");
+        img.addEventListener("error", function () { cap.textContent = f.name + " · " + size + " · could not be loaded (the call may have ended)"; });
+        return;
+      }
+      var row = box.appendChild(el("div", "file-row"));
+      row.appendChild(el("span", "file-name", f.name)).setAttribute("dir", "auto");
+      row.appendChild(el("span", "file-size", "· " + size + " ·"));
+      var open = row.appendChild(outLink(url));
+      open.textContent = "Open";
+      open.setAttribute("aria-label", "Open " + f.name + " in a new tab");
+    });
+    return box;
+  }
+
+  /* ---------------------------------------------- files from the user -- */
+
+  /* Attach, drag and drop, or paste. Each file uploads at once (with its progress on its chip)
+     and waits on this computer until the user's next request, typed or spoken, takes it along.
+     Names and contents never go to OpenAI: the voice only hears that files were attached. */
+  var UPLOAD_MAX = 25 * 1024 * 1024, PENDING_MAX = 20;
+  var pending = [], uploads = [], removing = {}, gone = {}, waitingToSend = false;
+
+  function chip(text, removeLabel, onRemove, cls) {
+    var c = el("div", "chip" + (cls ? " " + cls : ""));
+    c.appendChild(el("span", "chip-text", text)).setAttribute("dir", "auto");
+    var x = c.appendChild(el("button", "plain", "Remove"));
+    x.type = "button";
+    x.setAttribute("aria-label", removeLabel);
+    x.addEventListener("click", onRemove);
+    return c;
+  }
+
+  function renderAttach() {
+    var box = $("chips");
+    box.textContent = "";
+    uploads.forEach(function (u) { box.appendChild(u.chip); });
+    pending.forEach(function (p) {
+      box.appendChild(chip(p.name + " · " + human(p.size), "Remove " + p.name, function () { removeAttachment(p); }));
+    });
+    box.hidden = !uploads.length && !pending.length;
+    noteAttach();
+  }
+
+  function noteAttach() {
+    var parts = [];
+    if (uploads.length) parts.push("Uploading " + uploads.map(function (u) { return u.name + " " + u.pct + "%"; }).join(", ") + ".");
+    if (waitingToSend) parts.push("Your request goes to Claude as soon as the upload finishes.");
+    else if (pending.length) parts.push(pending.length + " file(s) ready. They go to Claude with your next request, typed or spoken.");
+    $("attachNote").textContent = parts.join(" ");
+    $("attachNote").hidden = !parts.length;
+  }
+
+  function pastedName(type) {
+    var d = new Date();
+    var two = function (n) { return String(n).padStart(2, "0"); };
+    var ext = { "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" }[type] || "png";
+    return "pasted-image-" + two(d.getHours()) + two(d.getMinutes()) + two(d.getSeconds()) + "." + ext;
+  }
+
+  function uploadFiles(list, how) {
+    var files = [].slice.call(list || []);
+    if (!files.length) return;
+    if (phase === "ended") { addLine("Error", "The call has ended, so nothing was shared.", "err"); return; }
+    var batch = { left: files.length, ok: 0 };
+    files.forEach(function (f) {
+      var name = f.name || "";
+      // A pasted screenshot has no real name (Chrome calls every one of them image.png).
+      if (how === "paste" && /^image\//.test(f.type) && (!name || name === "image.png")) name = pastedName(f.type);
+      name = name || "file";
+      var why = f.size > UPLOAD_MAX ? name + " is too big to share (" + human(f.size) + "; the limit is 25 MB)."
+        : pending.length + uploads.length >= PENDING_MAX ? "Not shared: " + name + ". 20 files are already waiting; send or remove some first."
+        : "";
+      if (why) { addLine("Error", why, "err"); batchDone(batch, false); return; }
+      startUpload(f, name, batch);
+    });
+  }
+
+  // One note to the voice per pick, drop or paste, once its uploads have all finished.
+  function batchDone(batch, ok) {
+    if (ok) batch.ok++;
+    if (--batch.left || !batch.ok) return;
+    thinking(null, "The user attached " + batch.ok + " file(s) on the call page. They go to Claude with the user's next request; you cannot see them.");
+  }
+
+  function uploadError(status, name, j) {
+    if (status === 413) return name + " is too big to share (the limit is 25 MB).";
+    if (status === 429) return "Not shared: " + name + ". 20 files are already waiting; send or remove some first.";
+    if (status === 409) return "The call has ended, so " + name + " was not shared.";
+    return "Could not share " + name + ": " + ((j && j.error) || "HTTP " + status) + ".";
+  }
+
+  /* XMLHttpRequest, not fetch: only it reports upload progress, and a chip that sits at "uploading"
+     with no number for a big file looks frozen. */
+  function startUpload(f, name, batch) {
+    var x = new XMLHttpRequest();
+    var u = { name: name, pct: 0, quiet: false, xhr: x };
+    u.chip = chip("uploading " + name + " 0%", "Remove " + name, function () { x.abort(); }, "up");
+    uploads.push(u);
+    renderAttach();
+    u.done = new Promise(function (resolve) {
+      var over = false;
+      function end(ok, err, j) {
+        if (over) return;
+        over = true;
+        var k = uploads.indexOf(u);
+        if (k >= 0) uploads.splice(k, 1);
+        // The attachments frame usually lands first; this only fills the gap if it has not.
+        if (ok && !gone[j.id] && !pending.some(function (p) { return p.id === j.id; })) {
+          pending.push({ id: j.id, name: j.name || name, size: j.size, type: j.type });
+        }
+        if (err) addLine("Error", err, "err");
+        renderAttach();
+        batchDone(batch, ok);
+        resolve();
+      }
+      x.upload.addEventListener("progress", function (e) {
+        if (!e.lengthComputable || !e.total) return;
+        u.pct = Math.min(100, Math.floor(e.loaded / e.total * 100));
+        u.chip.firstChild.textContent = "uploading " + name + " " + u.pct + "%";
+        noteAttach();
+      });
+      x.addEventListener("load", function () {
+        var j = {};
+        try { j = JSON.parse(x.responseText) || {}; } catch (e) {}
+        if (x.status === 200 && j.id) end(true, "", j);
+        else end(false, uploadError(x.status, name, j));
+      });
+      x.addEventListener("error", function () { end(false, "Could not share " + name + ": the upload to Claude's computer failed."); });
+      x.addEventListener("abort", function () {
+        end(false, "");
+        if (!u.quiet) addLine("Call", "stopped uploading " + name + "; it was not shared", "note");
+      });
+      x.open("POST", BASE + "/upload");
+      x.setRequestHeader("content-type", "application/octet-stream");
+      x.setRequestHeader("x-ttc-name", encodeURIComponent(name));
+      if (f.type) x.setRequestHeader("x-ttc-type", f.type);
+      x.send(f);
+    });
+  }
+
+  async function removeAttachment(p) {
+    removing[p.id] = true;
+    gone[p.id] = true;
+    pending = pending.filter(function (x) { return x.id !== p.id; });
+    renderAttach();
+    try {
+      var r = await api("/attachments/remove", { id: p.id });
+      if (r.ok) addLine("Call", "removed " + p.name + "; Claude will not get it", "note");
+      else addLine("Error", p.name + " could not be removed: it is no longer waiting (it may already have gone to Claude).", "err");
+    } catch (e) {
+      addLine("Error", "Could not remove " + p.name + ": " + String((e && e.message) || e), "err");
+    }
+  }
+
+  /* The bridge is the truth about what is waiting. A file that leaves the list without the user
+     removing it went to Claude with a request. */
+  function onAttachments(list) {
+    var now = {};
+    list.forEach(function (p) { if (p && p.id) now[p.id] = true; });
+    var dropped = pending.filter(function (p) { return !now[p.id]; });
+    var shared = dropped.filter(function (p) { return !removing[p.id]; });
+    dropped.forEach(function (p) { gone[p.id] = true; delete removing[p.id]; });
+    pending = list.filter(function (p) { return p && p.id; });
+    renderAttach();
+    if (!shared.length) return;
+    var n = frameN, names = shared.map(function (p) { return p.name; }).join(", ");
+    /* A request takes the files with it, and its working or status frame comes next. The bridge
+       ending the call lets go of them too, and then the very next frame is the end. */
+    setTimeout(function () {
+      if (endFrameN === n + 1) {
+        addLine("Call", shared.length + " file(s) you attached did not go with a request: " + names + ". Claude gets them in the end-of-call hand-off.", "note");
+        return;
+      }
+      if (endSeen || phase === "ended") return;
+      addLine("You", "shared: " + names, "you");
+    }, 400);
+  }
+
+  function endAttachments() {
+    uploads.slice().forEach(function (u) { u.quiet = true; u.xhr.abort(); });
+    if (pending.length) {
+      addLine("Call", pending.length + " file(s) you attached did not go with a request: "
+        + pending.map(function (p) { return p.name; }).join(", ") + ". Claude gets them in the end-of-call hand-off.", "note");
+    }
+    pending = [];
+    waitingToSend = false;
+    renderAttach();
+  }
+
+  /* ---------------------------------------------------------- requests -- */
+
+  /* Every request Claude has open, each with a Stop. The rows are rebuilt only when the list
+     itself changes (the clocks tick in place), and a rebuilt Stop stays dead for a moment, so a
+     click never lands on a row that just swapped in under the pointer. */
+  var items = [], itemSig = "", rows = {}, acts = {}, stepsOpen = {}, stopBusy = {}, stopArm = null;
+
+  function newestItem(state) {
+    for (var k = items.length - 1; k >= 0; k--) if (items[k].state === state) return items[k];
+    return null;
+  }
+
+  function setItems(list) {
+    items = list.filter(function (it) { return it && it.id; });
+    var sig = items.map(function (it) { return it.id + ":" + it.state + ":" + (it.files || 0); }).join("|");
+    if (sig !== itemSig) { itemSig = sig; buildRows(); }
+    else items.forEach(function (it) { if (rows[it.id]) rows[it.id].it = it; });
+    tickItems();
+  }
+
+  function buildRows() {
+    var box = $("reqs");
+    box.textContent = "";
+    rows = {};
+    items.forEach(function (it) {
+      var li = box.appendChild(el("li", "req-" + it.state));
+      var top = li.appendChild(el("div", "req-top"));
+      var label = top.appendChild(el("span", "req-label"));
+      var head = label.appendChild(document.createTextNode(""));
+      label.appendChild(el("bdi", "", it.text || ""));
+      if (it.files) label.appendChild(document.createTextNode(" · " + it.files + " file(s)"));
+      var btn = null;
+      if (it.state !== "stopping") {
+        btn = top.appendChild(el("button", "stop small", "Stop"));
+        btn.type = "button";
+        btn.setAttribute("aria-label", "Stop request " + it.id);
+        btn.disabled = true;
+        btn.addEventListener("click", function () { stopRequest(it.id, btn); });
+      }
+      var now = li.appendChild(el("p", "req-now"));
+      now.hidden = true;
+      var det = li.appendChild(el("details", "req-steps"));
+      det.hidden = true;
+      det.open = Boolean(stepsOpen[it.id]);
+      det.addEventListener("toggle", function () { stepsOpen[it.id] = det.open; });
+      var sum = det.appendChild(el("summary"));
+      var ol = det.appendChild(el("ol"));
+      rows[it.id] = { it: it, head: head, btn: btn, now: now, det: det, sum: sum, ol: ol };
+      paintActivity(it.id);
+    });
+    box.hidden = !items.length;
+    for (var k in acts) if (!rows[k]) delete acts[k];
+    clearTimeout(stopArm);
+    stopArm = setTimeout(function () {
+      for (var id in rows) if (rows[id].btn && !stopBusy[id]) rows[id].btn.disabled = false;
+    }, 700);
+  }
+
+  function tickItems() {
+    var now = Date.now();
+    for (var id in rows) {
+      var it = rows[id].it;
+      var st = it.state === "working" ? "working " + mmss(now - (it.at || now))
+        : it.state === "stopping" ? "stopping..." : String(it.state || "");
+      rows[id].head.textContent = it.id + " · " + st + " · ";
+    }
+  }
+
+  async function stopRequest(id, btn) {
+    var it = rows[id] ? rows[id].it : null;
+    if (!it || stopBusy[id]) return;
+    stopBusy[id] = true;
+    btn.disabled = true;
+    btn.textContent = "Stopping...";
+    var queued = it.state === "queued";
+    if (phase !== "ended") setStatus("Stopping " + id + "...", queued ? "Taking it out of the queue before Claude starts it." : "Telling Claude to stop working on it.");
+    var r = null, j = {};
+    try {
+      r = await api("/cancel", { id: id });
+      j = await r.json().catch(function () { return {}; });
+    } catch (e) { j = { error: String((e && e.message) || e) }; }
+    delete stopBusy[id];
+    if (!r || !r.ok) {
+      btn.disabled = false;
+      btn.textContent = "Stop";
+      addLine("Error", id + " could not be stopped: " + (j.error || "it is not open any more") + ".", "err");
+      if (phase !== "ended") setStatus("Could not stop " + id + ".", j.error || "It had already finished.");
+      return;
+    }
+    var was = j.was || it.state;
+    thinking(null, "The user pressed Stop on the call page for one of Claude's requests. "
+      + (was === "queued" ? "It was taken out of the queue before Claude started it." : "Claude is stopping it."));
+    if (phase !== "ended") {
+      setStatus(was === "queued" ? "Took " + id + " out of the queue." : "Stopping " + id + ".",
+        was === "queued" ? "Claude never started it." : "Claude stops at its next step and says what, if anything, was already changed.");
+    }
+  }
+
+  /* What Claude is doing right now (one line per tool it runs), under the request it belongs
+     to. Shown here only: never sent to OpenAI. Hidden until the first step arrives, so a bridge
+     without the activity hook shows nothing rather than an empty box. */
+  function onActivity(m) {
+    var w = newestItem("working") || newestItem("stopping");
+    var id = m.id || (w && w.id);
+    if (id && addStep(id, m)) paintActivity(id);
+  }
+
+  /* A reloaded or reconnected page gets the steps so far with its hello, and a reconnect then
+     replays the frames it missed, so a step can arrive twice: it is kept once. */
+  function addStep(id, m) {
+    var list = acts[id] || (acts[id] = []);
+    var a = { tool: String(m.tool || ""), summary: String(m.summary || ""), at: Number(m.at) || Date.now() };
+    for (var k = 0; k < list.length; k++) {
+      if (list[k].at === a.at && list[k].tool === a.tool && list[k].summary === a.summary) return false;
+    }
+    list.push(a);
+    if (list.length > 1 && list[list.length - 2].at > a.at) list.sort(function (x, y) { return x.at - y.at; });
+    if (list.length > 30) list.shift();
+    return true;
+  }
+
+  // Only for requests still open: steps of finished work are history, not "now".
+  function restoreActivity(list) {
+    if (!Array.isArray(list)) return;
+    var touched = {};
+    list.forEach(function (a) { if (a && a.id && rows[a.id] && addStep(a.id, a)) touched[a.id] = true; });
+    for (var id in touched) paintActivity(id);
+  }
+
+  function stepText(a) {
+    return a.summary && a.tool && a.summary !== a.tool && a.tool.indexOf("mcp__") !== 0 ? a.tool + " · " + a.summary : (a.summary || a.tool);
+  }
+
+  function paintActivity(id) {
+    var r = rows[id], list = acts[id];
+    if (!r || !list || !list.length) return;
+    r.now.hidden = false;
+    r.now.textContent = "Now: " + stepText(list[list.length - 1]);
+    r.det.hidden = false;
+    r.sum.textContent = "Steps so far (" + list.length + ")";
+    r.ol.textContent = "";
+    list.forEach(function (a) {
+      r.ol.appendChild(el("li", "", clockTime(a.at, true) + " · " + stepText(a))).setAttribute("dir", "auto");
+    });
+  }
+
+  /* ------------------------------------------------ permission banner -- */
+
+  /* Claude Code's own permission prompt stalls the work, and a plugin cannot answer it. The call
+     can only say so, loudly, until Claude moves again (its next say, step or notice). */
+  var permTimer = null, permShownAt = 0, PERM_GRACE_MS = 3000;
+
+  function showPerm(t) {
+    $("permText").textContent = t;
+    $("permBox").hidden = false;
+    permShownAt = Date.now();
+    clearTimeout(permTimer);
+    permTimer = setTimeout(hidePerm, 10 * 60000);
+    $("permBox").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function hidePerm() {
+    clearTimeout(permTimer);
+    $("permBox").hidden = true;
+  }
+
   /* ------------------------------------------------------------ wiring -- */
 
   $("go").addEventListener("click", function () { start(); });
@@ -848,6 +1925,58 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
   $("approve").addEventListener("click", function () { answerConfirm(true); });
   $("decline").addEventListener("click", function () { answerConfirm(false); });
   $("changeKey").addEventListener("click", function () { showKey(); });
+  $("permHide").addEventListener("click", hidePerm);
+  $("screenPrev").addEventListener("click", function () { showScreen(screenAt - 1); });
+  $("screenNext").addEventListener("click", function () { showScreen(screenAt + 1); });
+  $("screenCopy").addEventListener("click", function () {
+    var e = screens[screenAt];
+    if (e && e.display) copyText(e.display, $("screenCopy"), $("screenCopied"));
+  });
+
+  $("attach").addEventListener("click", function () { if (phase !== "ended") $("fileInput").click(); });
+  $("fileInput").addEventListener("change", function () {
+    uploadFiles($("fileInput").files, "pick");
+    $("fileInput").value = "";   // the same file can be picked again later
+  });
+
+  /* Drop anywhere on the page. The overlay is only a picture (it takes no pointer events), and
+     it only shows for a drag that carries files, not for text dragged around inside the page. */
+  var dragDepth = 0;
+  function dragsFiles(e) { return Boolean(e.dataTransfer) && [].indexOf.call(e.dataTransfer.types || [], "Files") >= 0; }
+  window.addEventListener("dragenter", function (e) {
+    if (!dragsFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    $("dropZone").hidden = phase === "ended";
+  });
+  window.addEventListener("dragover", function (e) {
+    if (!dragsFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = phase === "ended" ? "none" : "copy";
+  });
+  window.addEventListener("dragleave", function (e) {
+    if (!dragsFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) $("dropZone").hidden = true;
+  });
+  window.addEventListener("drop", function (e) {
+    if (!dragsFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    $("dropZone").hidden = true;
+    uploadFiles(e.dataTransfer.files, "drop");
+  });
+
+  // A pasted screenshot or file is shared; pasted text goes into the box as usual.
+  document.addEventListener("paste", function (e) {
+    var dt = e.clipboardData;
+    if (!dt) return;
+    var files = [].slice.call(dt.files || []);
+    if (!files.length) [].forEach.call(dt.items || [], function (it) { var f = it.kind === "file" && it.getAsFile(); if (f) files.push(f); });
+    if (!files.length) return;
+    e.preventDefault();
+    uploadFiles(files, "paste");
+  });
 
   $("keyForm").addEventListener("submit", async function (e) {
     e.preventDefault();
@@ -871,13 +2000,26 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
     }
   });
 
+  /* Send works with only files attached. Files still uploading belong to this request, so it
+     waits for them rather than going without. */
+  var sendingTyped = false;
   $("typeForm").addEventListener("submit", async function (e) {
     e.preventDefault();
     var t = $("typed").value.trim();
-    if (!t || phase === "ended") return;
+    if (sendingTyped || phase === "ended" || (!t && !pending.length && !uploads.length)) return;
+    sendingTyped = true;
     $("typed").value = "";
-    addLine("You (typed)", t, "you");
     try {
+      if (uploads.length) {
+        waitingToSend = true;
+        noteAttach();
+        await Promise.all(uploads.map(function (u) { return u.done; }));
+        waitingToSend = false;
+        noteAttach();
+      }
+      if (phase === "ended") return;
+      if (!t && !pending.length) { addLine("Error", "Nothing was sent: the upload did not finish, so there was no file and no message.", "err"); return; }
+      addLine("You (typed)", t || "(no message: sending the file(s) you attached)", "you");
       var r = await api("/typed", { text: t });
       var j = await r.json().catch(function () { return {}; });
       if (!r.ok) { addLine("Error", j.error || "Claude did not get that.", "err"); return; }
@@ -885,10 +2027,15 @@ footer { color: var(--muted); font-size: 13px; margin-top: 6px; }
       lastActivity = Date.now();
     } catch (err) {
       addLine("Error", "Claude did not get that: " + String((err && err.message) || err), "err");
+    } finally {
+      sendingTyped = false;
+      waitingToSend = false;
     }
   });
 
   render();
+  if (Array.isArray(CFG.items)) setItems(CFG.items);
+  restoreActivity(CFG.activity);
   connectEvents();
   if (CFG.state === "ended") {
     phase = "ended";

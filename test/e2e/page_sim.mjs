@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-/* Deterministic page-side simulation of the 0.5.0 "nothing said is lost" behaviour.
+/* Deterministic page-side simulation of the 0.5.0 "nothing said is lost" behaviour (1-7) and the
+ * 0.6.0 rich parity features (8-17): what Claude shows on screen, files both ways, Stop and
+ * spoken cancel, the permission banner, the live activity line, the phone layout and the files
+ * that never went with a request.
  *
  * The REAL bridge (server/bridge.mjs over stdio) and the REAL call page (server/call.html) in
  * headless Chrome. Only the two things that would cost money or need hardware are faked:
@@ -7,9 +10,11 @@
  *   - The browser's media side: getUserMedia returns a silent AudioContext stream, and
  *     RTCPeerConnection is a stub whose data channel records what the page sends (window.__sent)
  *     and lets this harness play gpt-live-1's events into the page (window.__dc.onmessage).
- * Claude's side is driven with the MCP tools (call_next / call_say / call_instruct).
+ * Claude's side is driven with the MCP tools (call_next / call_say / call_instruct). The hooks'
+ * side (/notify, /activity) is driven with the hook token, the way hooks/guard.mjs does it.
  *
- * No OpenAI call, no Claude session, no cost. About 2.5 minutes.
+ * No OpenAI call, no Claude session, no cost. About 5 minutes. Screenshots of the new cards go
+ * to test/e2e/out/ (gitignored).
  *
  * Usage: node test/e2e/page_sim.mjs            all scenarios
  *        node test/e2e/page_sim.mjs 1 6        only scenarios 1 and 6
@@ -18,8 +23,10 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
+import crypto from "node:crypto";
 import { createRequire } from "node:module";
-import { startBridge, mockOpenAI, sleep } from "../helpers.mjs";
+import { startBridge, mockOpenAI, sleep, ROOT } from "../helpers.mjs";
 
 const PUPPETEER_FROM = process.env.PUPPETEER_FROM || "E:/FromC/projects/agency-board/package.json";
 const CHROME = process.env.CHROME_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe";
@@ -90,7 +97,8 @@ const delegation = (page, id) => live(page, { type: "session.delegation.created"
 const sent = (page) => page.evaluate(() => window.__sent);
 const commentaries = async (page) => (await sent(page)).filter((m) => m.type === "session.commentary.append");
 const logLines = (page) => page.evaluate(() => [...document.querySelectorAll("#log li")].map((li) => ({
-  who: li.querySelector(".who").textContent, text: li.lastChild.textContent, cls: li.className,
+  who: li.querySelector(".who").textContent, text: li.querySelector(".text").textContent, cls: li.className,
+  show: Boolean(li.querySelector("button.show")),
 })));
 const status = (page) => page.evaluate(() => document.getElementById("status").textContent + " | " + document.getElementById("detail").textContent);
 
@@ -117,6 +125,144 @@ function transcript(b) {
 }
 const requests = (b) => transcript(b).filter((l) => l.role === "request").map((l) => l.text);
 
+/* ------------------------------------------------------- 0.6.0 tools -- */
+
+const OUT = path.join(ROOT, "test", "e2e", "out");
+const FENCE = "```";
+
+// Everything the page sends that OpenAI reads. Display text, file names and activity must never be in it.
+const toVoice = async (page) => (await sent(page)).filter((m) => /^session\.(commentary|thinking|instructions)\.append$/.test(m.type));
+const thinkings = async (page) => (await sent(page)).filter((m) => m.type === "session.thinking.append");
+async function leaks(page, needles) {
+  return (await toVoice(page)).filter((m) => needles.some((n) => String(m.content).includes(n))).map((m) => m.content);
+}
+
+/* The hooks' side of the bridge, reached exactly like hooks/guard.mjs: port and hook token from
+   the handover file only this user can read, and no Origin header. */
+function hookSide(b) {
+  const port = Number(new URL(b.launchUrl()).port);
+  const f = JSON.parse(fs.readFileSync(path.join(b.data, "bridges", `${port}.json`), "utf8"));
+  return { base: `http://127.0.0.1:${port}/c/${f.call}`, token: f.hookToken };
+}
+async function hookPost(b, sub, body) {
+  const h = hookSide(b);
+  const r = await fetch(h.base + sub, {
+    method: "POST", headers: { "content-type": "application/json", "x-ttc-hook": h.token }, body: JSON.stringify(body),
+  });
+  let json = null;
+  try { json = await r.json(); } catch {}
+  return { status: r.status, json };
+}
+
+/* A real PNG (solid colour), so a thumbnail can prove it decoded: naturalWidth > 0. */
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (const byte of buf) {
+    let c = (crc ^ byte) & 0xff;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crc = (crc >>> 8) ^ c;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function png(w, h, [r, g, b]) {
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) raw.set([r, g, b], y * (w * 3 + 1) + 1 + x * 3);
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4), crc = Buffer.alloc(4), td = Buffer.concat([Buffer.from(type), data]);
+    len.writeUInt32BE(data.length);
+    crc.writeUInt32BE(crc32(td));
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 2;   // 8-bit RGB
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+}
+
+function scratch(b, name) {
+  const d = path.join(b.data, name);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+/* The request's "Files the user shared with this request" block (or another heading's, such as the
+   end-of-call hand-off's never-sent list): one "- <path> (<type>, <size>)" line per file. */
+function sharedPaths(reqText, heading = "Files the user shared with this request") {
+  const i = reqText.indexOf(heading);
+  if (i < 0) return [];
+  const out = [];
+  for (const l of reqText.slice(i).split("\n").slice(1)) {
+    const m = /^- (.+) \([^()]*\)$/.exec(l.trim());
+    if (!m) break;
+    out.push(m[1]);
+  }
+  return out;
+}
+
+const chipTexts = (page) => page.evaluate(() => [...document.querySelectorAll("#chips .chip-text")].map((c) => c.textContent));
+const readyChips = async (page) => (await chipTexts(page)).filter((t) => !t.startsWith("uploading "));
+const reqRows = (page) => page.evaluate(() => [...document.querySelectorAll("#reqs > li")].map((li) => {
+  const btn = li.querySelector(".req-top button"), now = li.querySelector(".req-now"), det = li.querySelector(".req-steps");
+  return {
+    label: li.querySelector(".req-label").textContent,
+    btn: btn ? { label: btn.getAttribute("aria-label"), disabled: btn.disabled, text: btn.textContent } : null,
+    now: now && !now.hidden ? now.textContent : null,
+    steps: det && !det.hidden ? det.querySelector("summary").textContent : null,
+    stepItems: det ? det.querySelectorAll("li").length : 0,
+  };
+}));
+const screenPos = (page) => page.evaluate(() => {
+  const box = document.getElementById("screenBox");
+  return box.hidden ? "" : document.getElementById("screenPos").textContent;
+});
+
+/* A normal voice hand-over that Claude picks up, so a request is in flight. */
+async function delegate(b, page, text, id) {
+  const next = timed(b.tool("call_next", { wait_seconds: 30 }));
+  await userSays(page, text);
+  await sleep(1000);
+  await delegation(page, id);
+  await sleep(150);
+  await voiceSays(page, "On it.");
+  return next;
+}
+
+/* Desktop 1280 and phone 390, at twice the pixels, then back to the harness's default viewport. */
+async function shots(page, name, selector) {
+  fs.mkdirSync(OUT, { recursive: true });
+  const saved = [];
+  for (const [w, h] of [[1280, 900], [390, 844]]) {
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: 2 });
+    await sleep(350);
+    const el = await page.$(selector);
+    const box = el && await el.boundingBox();
+    if (!box) continue;
+    const file = path.join(OUT, `${name}-${w}.png`);
+    await el.screenshot({ path: file });
+    saved.push(path.relative(ROOT, file).replace(/\\/g, "/"));
+  }
+  await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 1 });
+  return saved.join(", ") || "none (element not visible)";
+}
+
+/* Interactive things that overlap each other (outside the boxes that scroll on their own). */
+const overlaps = (page) => page.evaluate(() => {
+  const name = (e) => e.tagName.toLowerCase() + (e.id ? "#" + e.id : "") + (e.getAttribute("aria-label") ? `[${e.getAttribute("aria-label")}]` : "");
+  const els = [...document.querySelectorAll("button, input:not([type=file]), a, summary")].filter((e) => {
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && !e.closest("#screenBody, #log, .req-steps ol");
+  });
+  const out = [];
+  for (let i = 0; i < els.length; i++) for (let j = i + 1; j < els.length; j++) {
+    if (els[i].contains(els[j]) || els[j].contains(els[i])) continue;
+    const a = els[i].getBoundingClientRect(), c = els[j].getBoundingClientRect();
+    const w = Math.min(a.right, c.right) - Math.max(a.left, c.left), h = Math.min(a.bottom, c.bottom) - Math.max(a.top, c.top);
+    if (w > 1 && h > 1) out.push(name(els[i]) + " x " + name(els[j]));
+  }
+  return out;
+});
+
 /* ---------------------------------------------------------- the frame -- */
 
 let browser;
@@ -141,7 +287,7 @@ async function scenario(num, name, fn) {
     TTC_PAGE_GONE_SECONDS: "3600",
   });
   let ctx = null, page = null;
-  const pageErrors = [], consoleErrors = [];
+  const pageErrors = [], consoleErrors = [], dialogs = [];
   say(`#${num} ${name}: start`);
   try {
     await b.init();
@@ -150,6 +296,8 @@ async function scenario(num, name, fn) {
     page = await ctx.newPage();
     page.on("pageerror", (e) => pageErrors.push(e.message));
     page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text()); });
+    // An alert() here means markdown from Claude ran as code.
+    page.on("dialog", (d) => { dialogs.push(d.type() + ": " + d.message()); d.dismiss().catch(() => {}); });
     await page.evaluateOnNewDocument(pageStub);
     await page.goto(b.launchUrl(), { waitUntil: "domcontentloaded" });
     await until(async () => JSON.parse(await b.tool("call_status")).pageConnected, 8000, "the page's event stream");
@@ -158,8 +306,9 @@ async function scenario(num, name, fn) {
     await live(page, { type: "session.started" });
     await until(async () => (await page.$eval("#go", (el) => el.textContent)) === "End call", 4000, "the page to go live");
     await until(async () => JSON.parse(await b.tool("call_status")).state === "live", 4000, "the bridge to see the call live");
-    await fn({ b, page, mock, check });
+    await fn({ b, page, mock, check, ctx, info: (label) => { evidence.push("info: " + label); say(`#${num}`, "info: " + label); } });
     check(pageErrors.length === 0, "no uncaught errors in the page", pageErrors.join(" | ") || "none");
+    check(dialogs.length === 0, "no alert or confirm dialog ever opened", dialogs.join(" | ") || "none");
     const again = (await commentaries(page)).filter((c) => /say it again/i.test(c.content));
     check(again.length === 0, "the voice was never told 'Could you say it again'", again.length ? again.map((c) => c.content).join(" | ") : "none");
   } catch (e) {
@@ -391,6 +540,526 @@ def(7, "Claude asked a question, the user just says OK", async ({ b, page, check
     "the bare 'OK.' was handed over as overheard r2", `${firstLine(r2.text)} (${((r2.at - okAt) / 1000).toFixed(1)}s after it)`);
   check(r2.text.includes('"OK."'), "the request text is the user's OK");
   check(r2.text.includes("Voice: Claude fixed it and asks: should it also update the README?"), "Claude gets the question it asked as context");
+});
+
+/* ------------------------------------------------ 0.6.0 rich parity -- */
+
+const DISPLAY_NOTE = "Claude also put details on the user's screen, on the call page.";
+
+const RICH = [
+  "# Deploy notes ZEBRA7731",
+  "Some **bold**, *italic*, ~~old~~ and `inline code`.",
+  "",
+  "<img src=x onerror=alert(1)>",
+  "<script>window.__xss = 1</script>",
+  "[x](javascript:alert(1))",
+  "[docs](https://example.com/docs) and https://example.com/bare?q=1.",
+  "",
+  "| Step | Command | Result |",
+  "|:-----|:-------:|-------:|",
+  "| 1 | `npm test` | 42 passed |",
+  "| 2 | deploy | ok |",
+  "",
+  FENCE + "js",
+  "const answer = 42; // ZEBRA7731",
+  'console.log("<b>not bold</b>");',
+  FENCE,
+  "",
+  FENCE + "diff",
+  "- old line",
+  "+ new line",
+  FENCE,
+  "",
+  "> quoted **note**",
+  "",
+  "1. first",
+  "   - nested a",
+  "   - nested b",
+  "2. second",
+  "",
+  "שלום, זו פסקה בעברית עם קוד `npm test`.",
+  "",
+  "---",
+].join("\n");
+
+def(8, "On screen: markdown rendered safely (XSS payloads stay text), table, code with Copy, Hebrew, Show on screen", async ({ b, page, check, ctx, info }) => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "call.html"), "utf8");
+  const banned = ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"].filter((w) => src.includes(w));
+  check(banned.length === 0, "call.html never uses innerHTML, outerHTML, insertAdjacentHTML or document.write", banned.join(", ") || "none");
+  const origin = new URL(page.url()).origin;
+  try { await ctx.overridePermissions(origin, ["clipboard-read", "clipboard-write", "clipboard-sanitized-write"]); } catch (e) { info("clipboard permissions not granted: " + e.message); }
+
+  const r1 = await delegate(b, page, "Show me the deploy script and the test results.", "del_s8");
+  check(/^REQUEST r1 /.test(r1.text), "the request reached Claude", firstLine(r1.text));
+  info("the request's answer line: " + ((r1.text.match(/[^\n]*call_say[^\n]*/) || [""])[0].slice(0, 200)));
+  const said = await b.tool("call_say", { id: "r1", text: "I put the script and the results on your screen.", display: RICH });
+  check(/on screen/i.test(said), "the call_say result says what was shown", firstLine(said));
+  await until(async () => (await screenPos(page)) === "1 of 1", 5000, "the On screen card");
+  const v = await page.evaluate(() => {
+    const body = document.getElementById("screenBody"), md = body.querySelector(".md");
+    const heb = [...md.querySelectorAll("p")].find((p) => /[֐-׿]/.test(p.textContent));
+    let rtl = null;
+    try { rtl = heb ? heb.matches(":dir(rtl)") : null; } catch {}
+    const t = md.querySelector(".tablewrap table");
+    return {
+      text: body.textContent, imgs: body.querySelectorAll("img").length, scripts: body.querySelectorAll("script").length,
+      bolds: body.querySelectorAll("b").length, xss: window.__xss,
+      links: [...body.querySelectorAll("a")].map((a) => ({ href: a.getAttribute("href"), text: a.textContent, target: a.target, rel: a.rel })),
+      h3: (md.querySelector("h3") || {}).textContent,
+      table: t ? { th: [...t.querySelectorAll("th")].map((x) => x.textContent), rows: t.querySelectorAll("tbody tr").length,
+        mid: t.querySelectorAll("th")[1].style.textAlign, code: Boolean(t.querySelector("td code")) } : null,
+      code: [...md.querySelectorAll(".code")].map((c) => ({ lang: c.querySelector(".code-lang").textContent, text: c.querySelector("pre code").textContent, copy: Boolean(c.querySelector(".code-bar button")) })),
+      diff: { add: md.querySelectorAll(".d-add").length, del: md.querySelectorAll(".d-del").length },
+      nested: md.querySelectorAll("ol > li > ul > li").length,
+      quote: Boolean(md.querySelector("blockquote strong")),
+      inlines: ["strong", "em", "del", "code"].filter((tag) => md.querySelector("p " + tag)),
+      heb: heb ? { dir: heb.getAttribute("dir"), rtl } : null,
+      noDir: [...md.querySelectorAll("p, h3, h4, h5, h6, ul, ol, li, blockquote, table, th, td")].filter((e) => e.getAttribute("dir") !== "auto").map((e) => e.tagName),
+      meta: document.getElementById("screenMeta").textContent,
+    };
+  });
+  check(v.xss === undefined && v.scripts === 0 && v.imgs === 0, "no script ran and no element was made from raw HTML", `__xss=${v.xss} scripts=${v.scripts} imgs=${v.imgs}`);
+  check(v.text.includes("<img src=x onerror=alert(1)>") && v.text.includes("<script>window.__xss = 1</script>"), "raw HTML is shown as text");
+  check(v.text.includes("[x](javascript:alert(1))") && !v.links.some((l) => /^\s*javascript:/i.test(l.href || "") || l.text === "x"), "[x](javascript:alert(1)) is text, not a link", JSON.stringify(v.links.map((l) => l.href)));
+  check(v.links.length > 0 && v.links.every((l) => /^(https?:|mailto:)/.test(l.href)), "every link is http, https or mailto");
+  const docs = v.links.find((l) => l.text === "docs");
+  check(docs && docs.href === "https://example.com/docs" && docs.target === "_blank" && docs.rel === "noopener noreferrer", "a markdown link opens in a new tab with noopener noreferrer", JSON.stringify(docs));
+  check(v.links.some((l) => l.href === "https://example.com/bare?q=1" && l.text === "https://example.com/bare?q=1"), "a bare URL is linked, without the full stop after it");
+  check(v.h3 === "Deploy notes ZEBRA7731", "a markdown heading renders (h1 becomes h3 under the card's h2)", v.h3);
+  check(v.inlines.length === 4, "bold, italic, strike and inline code render", v.inlines.join(", "));
+  check(v.table && v.table.th.join("|") === "Step|Command|Result" && v.table.rows === 2 && v.table.mid === "center" && v.table.code, "the GFM table renders with alignment, inside its scroll wrapper", JSON.stringify(v.table));
+  const js = v.code.find((c) => c.lang === "js");
+  check(js && js.text === 'const answer = 42; // ZEBRA7731\nconsole.log("<b>not bold</b>");' && js.copy && v.bolds === 0, "the fenced code block shows its exact text, a language label and a Copy button", js && JSON.stringify(js));
+  check(v.diff.add === 1 && v.diff.del === 1, "a diff block colours its + and - lines", JSON.stringify(v.diff));
+  check(v.nested === 2 && v.quote, "nested list by indentation, and a blockquote with bold inside", `nested=${v.nested} quote=${v.quote}`);
+  check(v.heb && v.heb.dir === "auto" && v.heb.rtl !== false, "the Hebrew paragraph has dir=auto and reads right to left", JSON.stringify(v.heb));
+  check(v.noDir.length === 0, "every block has dir=auto", v.noDir.join(",") || "all");
+  check(v.meta.startsWith("answer to r1 · "), "meta line says whose answer it is", v.meta);
+
+  await page.bringToFront();
+  await page.click("#screenBody .code .code-bar button");
+  const copied = await until(async () => {
+    const t = await page.$eval("#screenBody .code .code-bar button", (el) => el.textContent);
+    return t !== "Copy" && t;
+  }, 3000, "the code Copy button to answer");
+  check(copied === "Copied", "the code block's Copy says Copied", copied);
+  try { info("clipboard after code Copy: " + JSON.stringify(await page.evaluate(() => navigator.clipboard.readText()))); } catch (e) { info("clipboard read-back unavailable: " + e.message); }
+
+  const lines = await logLines(page);
+  const answer = lines.find((l) => l.cls === "claude" && l.text.startsWith("I put the script"));
+  check(answer && answer.show, "the log line of that answer has a Show on screen button");
+  const notes = (await thinkings(page)).filter((m) => m.content === DISPLAY_NOTE);
+  check(notes.length === 1, "the voice got exactly one note that details are on screen", `${notes.length} note(s)`);
+  const leaked = await leaks(page, ["ZEBRA7731", "example.com", "Deploy notes", "not bold"]);
+  check(leaked.length === 0, "nothing from the display reached the voice", leaked.join(" | ") || "none");
+
+  // A second entry, then back to the first through the log's button.
+  await b.tool("call_say", { text: "One more note is on your screen.", display: "Second note ZEBRA7731b" });
+  await until(async () => (await screenPos(page)) === "2 of 2", 4000, "the second entry");
+  const meta2 = await page.$eval("#screenMeta", (el) => el.textContent);
+  check(meta2.startsWith("from Claude · "), "a say with no request is labelled from Claude", meta2);
+  await page.$$eval("#log button.show", (bs) => bs[0].click());
+  await until(async () => (await screenPos(page)) === "1 of 2", 3000, "Show on screen to jump back to the first entry");
+  const h3 = await page.$eval("#screenBody h3", (el) => el.textContent);
+  check(h3 === "Deploy notes ZEBRA7731", "Show on screen brought back the first entry", h3);
+  await page.click("#screenCopy");
+  const note = await until(async () => page.$eval("#screenCopied", (el) => el.textContent), 3000, "the Copy confirmation");
+  check(note === "Copied to the clipboard.", "the card's Copy shows a visible confirmation", note);
+  check((await thinkings(page)).filter((m) => m.content === DISPLAY_NOTE).length === 2, "one display note per say (two says, two notes)");
+  info("screenshots: " + await shots(page, "onscreen", "#screenBox"));
+
+  // Pathological input: every forward search is bounded, so this renders at once.
+  const nasty = "[".repeat(20000) + " " + "*a ".repeat(10000) + "`x ".repeat(10000) + "_".repeat(5000);
+  const t0 = Date.now();
+  await b.tool("call_say", { text: "Another note is on your screen.", display: nasty });
+  await until(async () => (await screenPos(page)) === "3 of 3", 8000, "the pathological entry to render");
+  const took = Date.now() - t0;
+  check(took < 4000, "a 75,000-character pathological display renders in under 4 seconds", `${took}ms`);
+});
+
+def(9, "files from Claude: an image thumbnail loads, a text file opens in a new tab", async ({ b, page, check, ctx, info }) => {
+  const dir = scratch(b, "claude-files");
+  const PNG = path.join(dir, "chart.png"), TXT = path.join(dir, "notes.txt");
+  fs.writeFileSync(PNG, png(64, 40, [30, 120, 200]));
+  fs.writeFileSync(TXT, "hello from a shared file ZEBRA9\n");
+  const said = await b.tool("call_say", {
+    text: "The chart and my notes are on your screen.",
+    display: "The chart:\n\n![weekly chart](chart.png)\n\nMy notes are in [the notes file](notes.txt).",
+    files: [PNG, TXT],
+  });
+  check(/2 file/.test(said), "the call_say result counts the files shown", firstLine(said));
+  await until(async () => (await screenPos(page)) === "1 of 1", 5000, "the On screen card");
+  const img = await until(() => page.evaluate(() => {
+    const t = document.querySelector("#screenBody .files figure img");
+    return t && t.complete && t.naturalWidth > 0 ? { w: t.naturalWidth, h: t.naturalHeight, src: t.getAttribute("src") } : null;
+  }), 5000, "the thumbnail to load");
+  check(img.w === 64 && img.h === 40 && /\/file\/[A-Za-z0-9_%-]+$/.test(img.src), "the image thumbnail actually loaded from /file/<token>", JSON.stringify(img));
+  const inMd = await page.evaluate(() => { const t = document.querySelector("#screenBody .md img"); return t ? { w: t.naturalWidth, alt: t.alt } : null; });
+  check(inMd && inMd.w === 64 && inMd.alt === "weekly chart", "![weekly chart](chart.png) in the markdown shows the shared picture", JSON.stringify(inMd));
+  const row = await page.evaluate(() => {
+    const r = document.querySelector("#screenBody .file-row");
+    const a = r && r.querySelector("a");
+    return r ? { text: r.textContent, href: a && a.getAttribute("href"), target: a && a.target, rel: a && a.rel } : null;
+  });
+  check(row && /^notes\.txt ?· \d+ B · ?Open$/.test(row.text), "the text file is a row: name · size · Open", row && row.text);
+  check(row && row.target === "_blank" && row.rel === "noopener noreferrer", "Open goes to a new tab with noopener noreferrer");
+  const tab = ctx.waitForTarget((t) => t.url().includes("/file/"), { timeout: 6000 });
+  await page.click("#screenBody .file-row a");
+  const target = await tab;
+  check(target.url().endsWith(row.href), "clicking Open opened the file in a new tab", target.url().replace(/^https?:\/\/[^/]+/, ""));
+  const got = await page.evaluate(async (u) => { const r = await fetch(u); return { status: r.status, type: r.headers.get("content-type"), text: await r.text() }; }, row.href);
+  check(got.status === 200 && /^text\/plain/.test(got.type || "") && got.text === "hello from a shared file ZEBRA9\n", "that tab's URL serves the file as text", `${got.status} ${got.type}`);
+  try {
+    const p2 = await target.page();
+    info("the new tab shows: " + JSON.stringify(await Promise.race([p2.evaluate(() => document.body && document.body.innerText), sleep(3000).then(() => "(timed out)")])));
+  } catch (e) { info("could not read the new tab (sandboxed): " + e.message); }
+  const leaked = await leaks(page, ["chart.png", "notes.txt", "weekly chart", "ZEBRA9"]);
+  check(leaked.length === 0, "no file name or content reached the voice", leaked.join(" | ") || "none");
+});
+
+def(10, "attach with the file input: progress chip, remove one, Send with only files", async ({ b, page, check, info }) => {
+  const dir = scratch(b, "to-share");
+  const A = path.join(dir, "alpha notes.txt"), B = path.join(dir, "beta.txt"), BIG = path.join(dir, "big.bin");
+  fs.writeFileSync(A, "alpha ZEBRA10 upload\n");
+  fs.writeFileSync(B, "beta\n");
+  const bigBytes = crypto.randomBytes(1536 * 1024);
+  fs.writeFileSync(BIG, bigBytes);
+  await page.evaluate(() => {
+    window.__chipTexts = [];
+    new MutationObserver(() => {
+      for (const c of document.querySelectorAll("#chips .chip-text")) window.__chipTexts.push(c.textContent);
+      const n = document.getElementById("attachNote");
+      if (!n.hidden) window.__chipTexts.push("NOTE " + n.textContent);
+    }).observe(document.getElementById("convoBox"), { subtree: true, childList: true, characterData: true });
+  });
+  const input = await page.$("#fileInput");
+  await input.uploadFile(A, B);
+  await until(async () => (await readyChips(page)).length === 2, 8000, "two ready chips");
+  const chips = await chipTexts(page);
+  check(chips.some((c) => /^alpha notes\.txt · \d+ B$/.test(c)) && chips.some((c) => /^beta\.txt · \d+ B$/.test(c)), "each file is a chip: name · size", chips.join(" | "));
+  const note = await until(async () => (await thinkings(page)).find((m) => /attached/.test(m.content)), 4000, "the attach note to the voice");
+  check(note.content === "The user attached 2 file(s) on the call page. They go to Claude with the user's next request; you cannot see them.", "the voice got one generic note for the two files", note.content);
+  const ready = await page.$eval("#attachNote", (el) => el.textContent);
+  check(/^2 file\(s\) ready\. They go to Claude with your next request/.test(ready), "the page says the files wait for the next request", ready);
+
+  await page.click('button[aria-label="Remove beta.txt"]');
+  await until(async () => !(await chipTexts(page)).some((c) => c.startsWith("beta.txt")), 4000, "the beta.txt chip to go");
+  check((await logLines(page)).some((l) => /^removed beta\.txt/.test(l.text)), "the log says beta.txt was removed");
+
+  // Throttled, so the chip has time to show its progress.
+  await page.emulateNetworkConditions({ download: -1, upload: 700 * 1024, latency: 0 });
+  await input.uploadFile(BIG);
+  await until(async () => (await readyChips(page)).some((c) => c.startsWith("big.bin · ")), 20000, "big.bin to finish uploading");
+  await page.emulateNetworkConditions(null);
+  const seen = [...new Set(await page.evaluate(() => window.__chipTexts))];
+  const progress = seen.filter((t) => /^uploading big\.bin \d+%$/.test(t));
+  check(progress.length > 0, "the chip showed 'uploading big.bin N%' while it uploaded", progress.slice(0, 8).join(", "));
+  info("upload status lines seen: " + seen.filter((t) => t.startsWith("NOTE Uploading")).slice(0, 4).join(" / "));
+  info("screenshots: " + await shots(page, "chips", "#convoBox"));
+
+  const next = timed(b.tool("call_next", { wait_seconds: 20 }));
+  await page.click("#send");
+  const r = await next;
+  check(/^REQUEST r1 \(typed on the call page\):/.test(r.text), "Send with an empty box and files pending made a typed request", firstLine(r.text));
+  check(r.text.includes("(no message: the user shared file(s) on the call page)"), "the request text says there was no message");
+  const paths = sharedPaths(r.text);
+  check(paths.length === 2 && paths.every((p) => path.isAbsolute(p) && fs.existsSync(p)), "call_next lists the files as absolute paths that exist", paths.join(" | "));
+  check(paths.some((p) => fs.readFileSync(p, "utf8") === "alpha ZEBRA10 upload\n") && paths.some((p) => fs.readFileSync(p).equals(bigBytes)), "both files arrived byte for byte");
+  check(!paths.some((p) => p.endsWith("beta.txt")), "the removed file did not go");
+  await until(async () => (await chipTexts(page)).length === 0, 4000, "the chips to clear");
+  const shared = await until(async () => (await logLines(page)).find((l) => l.who === "You" && l.text.startsWith("shared: ")), 4000, "the You shared line");
+  check(shared.text === "shared: alpha notes.txt, big.bin", "the log says what went: You shared: ...", "You " + shared.text);
+  const leaked = await leaks(page, ["alpha notes", "big.bin", "beta.txt", "ZEBRA10"]);
+  check(leaked.length === 0, "no file name or content reached the voice", leaked.join(" | ") || "none");
+});
+
+def(11, "paste a screenshot: it becomes pasted-image-HHMMSS.png and rides with the typed request", async ({ b, page, check }) => {
+  const bytes = png(48, 32, [220, 40, 40]);
+  const r0 = await page.evaluate((arr) => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array(arr)], "image.png", { type: "image/png" }));
+    const ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+    if (!ev.clipboardData) Object.defineProperty(ev, "clipboardData", { value: dt });
+    const box = document.getElementById("typed");
+    box.focus();
+    box.dispatchEvent(ev);
+    return { prevented: ev.defaultPrevented, typed: box.value };
+  }, [...bytes]);
+  check(r0.prevented && r0.typed === "", "the page took the pasted image (nothing pasted into the box as text)", JSON.stringify(r0));
+  const chipText = await until(async () => (await readyChips(page)).find((c) => /^pasted-image-\d{6}\.png · /.test(c)), 8000, "the pasted image chip");
+  check(true, "a pasted image with no real name becomes pasted-image-HHMMSS.png", chipText);
+  const next = timed(b.tool("call_next", { wait_seconds: 20 }));
+  await page.type("#typed", "What is wrong in this screenshot?");
+  await page.keyboard.press("Enter");
+  const r = await next;
+  check(/^REQUEST r1 \(typed on the call page\):/.test(r.text) && r.text.includes("What is wrong in this screenshot?"), "the typed request reached Claude", firstLine(r.text));
+  const paths = sharedPaths(r.text);
+  check(paths.length === 1 && path.isAbsolute(paths[0]) && /pasted-image-\d{6}\.png$/.test(paths[0]), "the screenshot rides with it as an absolute path", paths.join(" | "));
+  check(paths.length === 1 && fs.existsSync(paths[0]) && fs.readFileSync(paths[0]).equals(bytes), "the pasted bytes arrived intact");
+  check((await leaks(page, ["pasted-image"])).length === 0, "the file name never reached the voice");
+});
+
+def(12, "drag and drop: overlay while dragging, the file rides with the next spoken request", async ({ b, page, check, info }) => {
+  const CONTENT = "# Dropped notes\nZEBRA12 drop\n";
+  const fire = (type) => page.evaluate((t, content) => {
+    if (!window.__dt) {
+      window.__dt = new DataTransfer();
+      window.__dt.items.add(new File([content], "drop-notes.md", { type: "text/markdown" }));
+    }
+    const ev = new DragEvent(t, { dataTransfer: window.__dt, bubbles: true, cancelable: true });
+    document.body.dispatchEvent(ev);
+    const zone = document.getElementById("dropZone");
+    return { prevented: ev.defaultPrevented, shown: !zone.hidden && getComputedStyle(zone).display !== "none", text: zone.textContent };
+  }, type, CONTENT);
+  fs.mkdirSync(OUT, { recursive: true });
+  for (const [w, h] of [[1280, 900], [390, 844]]) {
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: 2 });
+    await fire("dragenter");
+    await sleep(200);
+    await page.screenshot({ path: path.join(OUT, `drop-overlay-${w}.png`) });
+    await fire("dragleave");
+  }
+  await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 1 });
+  info("screenshots: test/e2e/out/drop-overlay-1280.png, test/e2e/out/drop-overlay-390.png");
+  const enter = await fire("dragenter");
+  check(enter.prevented && enter.shown && enter.text === "Drop files to share them with Claude", "dragging files over the page shows the full-page overlay", JSON.stringify(enter));
+  await fire("dragover");
+  const drop = await fire("drop");
+  check(drop.prevented && !drop.shown, "the drop was taken and the overlay went away", JSON.stringify(drop));
+  await until(async () => (await readyChips(page)).some((c) => c.startsWith("drop-notes.md · ")), 8000, "the dropped file's chip");
+  const r = await delegate(b, page, "Summarise the notes I just dropped.", "del_s12");
+  check(/^REQUEST r1 \(spoken by the user/.test(r.text), "the spoken request reached Claude", firstLine(r.text));
+  const paths = sharedPaths(r.text);
+  check(paths.length === 1 && path.isAbsolute(paths[0]) && paths[0].endsWith("drop-notes.md"), "the dropped file rides with the spoken request as an absolute path", paths.join(" | "));
+  check(paths.length === 1 && fs.readFileSync(paths[0], "utf8") === CONTENT, "its content arrived intact");
+  check((await leaks(page, ["drop-notes", "ZEBRA12"])).length === 0, "the file never reached the voice");
+});
+
+def(13, "Stop buttons: a queued request is taken out, the working one is stopped and Claude is told", async ({ b, page, check, info }) => {
+  const r1 = await delegate(b, page, "Run the full test suite.", "del_s13");
+  check(/^REQUEST r1 /.test(r1.text), "r1 is in flight", firstLine(r1.text));
+  await page.type("#typed", "Also update the changelog.");
+  await page.keyboard.press("Enter");
+  const fresh = await until(async () => { const rows = await reqRows(page); return rows.length === 2 && rows; }, 5000, "two rows in the Requests list");
+  check(fresh[1].btn && fresh[1].btn.disabled, "a Stop that just swapped in is disabled for a moment", JSON.stringify(fresh[1].btn));
+  check(/^r1 · working \d+:\d\d · Run the full test suite\.$/.test(fresh[0].label), "row r1 reads 'r1 · working m:ss · <text>'", fresh[0].label);
+  check(/^r2 · queued · Also update the changelog\.$/.test(fresh[1].label), "row r2 reads 'r2 · queued · <text>'", fresh[1].label);
+  check(fresh[0].btn && fresh[0].btn.label === "Stop request r1" && fresh[1].btn.label === "Stop request r2", "each row has a Stop labelled for its request");
+  check(fresh[0].now === null && fresh[0].steps === null, "no activity line or Steps so far before any activity");
+  await sleep(800);
+  check((await reqRows(page)).every((r) => r.btn && !r.btn.disabled), "the Stop buttons arm after 700 ms");
+  info("screenshots: " + await shots(page, "requests", "#statusBox"));
+  await sleep(800);
+
+  await page.click('button[aria-label="Stop request r2"]');
+  await until(async () => { const rows = await reqRows(page); return rows.length === 1 && rows[0].label.startsWith("r1 ") && rows; }, 5000, "r2 to leave the list");
+  check((await logLines(page)).some((l) => /^took r2 out of the queue/.test(l.text)), "the log says r2 was taken out of the queue");
+  check((await thinkings(page)).some((m) => /pressed Stop/.test(m.content) && /taken out of the queue/.test(m.content)), "the voice was told generically that the user stopped one");
+  await sleep(800);
+  await page.click('button[aria-label="Stop request r1"]');
+  const stopping = await until(async () => { const rows = await reqRows(page); return rows[0] && /stopping\.\.\./.test(rows[0].label) && rows[0]; }, 5000, "r1 to show stopping...");
+  check(/^r1 · stopping\.\.\. · /.test(stopping.label) && !stopping.btn, "r1 now reads 'stopping...' with no Stop button", stopping.label);
+  const st = await status(page);
+  check(/^Stopping r1\./.test(st), "the status line says exactly what is happening", st);
+
+  const p = await b.tool("call_say", { id: "r1", text: "Still running the tests.", final: false });
+  check(p.startsWith('STOP r1: the user cancelled "Run the full test suite." on the call.'), "Claude's next call_say result starts with the STOP notice", firstLine(p));
+  const closed = await b.tool("call_say", { id: "r1", text: "Stopped. Nothing was changed." });
+  check(!closed.startsWith("STOP") && /r1/.test(closed), "Claude closes it with call_say, told only once", firstLine(closed));
+  await until(async () => (await reqRows(page)).length === 0, 4000, "the list to empty");
+  const r2 = await timed(b.tool("call_next", { wait_seconds: 5 }));
+  check(/^Nothing new yet/.test(r2.text), "the stopped queued request never reached Claude", firstLine(r2.text));
+});
+
+def(14, "spoken cancel: 'Stop.' stops the work at once, and the voice's own hand-over of it is not a new request", async ({ b, page, check }) => {
+  const r1 = await delegate(b, page, "Refactor the whole server folder.", "del_s14");
+  check(/^REQUEST r1 /.test(r1.text), "r1 is in flight", firstLine(r1.text));
+  await until(async () => (await reqRows(page)).length === 1, 4000, "r1 in the Requests list");
+  const waiting = timed(b.tool("call_next", { wait_seconds: 30 }));
+  await sleep(300);
+  await userSays(page, "Stop.");
+  const saidAt = Date.now();
+  await sleep(500);
+  await delegation(page, "del_s14b");   // the voice hands the "stop" over too, as it often does
+  const w = await waiting;
+  check(w.text.startsWith('STOP r1: the user cancelled "Refactor the whole server folder." on the call.') && w.text.includes("Then call call_next again."),
+    "the waiting call_next returned the STOP notice at once", `${firstLine(w.text)} (${((w.at - saidAt) / 1000).toFixed(1)}s after 'Stop.')`);
+  const c = await until(async () => (await commentaries(page)).find((m) => m.content === "The user cancelled Claude's request. Say only: Cancelled."), 4000, "the cancel commentary");
+  check(c.delegation_id === null, "the voice was told to say only 'Cancelled.'", c.content);
+  const d = await until(async () => (await sent(page)).find((m) => m.delegation_id === "del_s14b"), 6000, "the page's answer to the voice's own delegation");
+  check(d.type === "session.commentary.append" && d.content === "That was the user cancelling; it is done. Say only: Cancelled.", "the voice's delegation of 'Stop.' was answered, not handed over", d.content);
+  await sleep(1500);
+  check(requests(b).length === 1, "no new request was created from 'Stop.'", JSON.stringify(requests(b)));
+  check(!transcript(b).some((l) => l.role === "user" && /^stop\.?$/i.test(l.text)), "'Stop.' is not in the hand-off as something still to do");
+  check((await logLines(page)).some((l) => l.cls === "note" && /stopping r1/.test(l.text)), "the page log says it is stopping r1");
+
+  // Saying it again while r1 is still stopping is not a request either.
+  const again = timed(b.tool("call_next", { wait_seconds: 10 }));
+  await userSays(page, "Stop it.");
+  await until(async () => (await logLines(page)).some((l) => l.cls === "note" && l.text === "you said stop; r1 is already stopping"), 5000, "the page to say r1 is already stopping");
+  const cancels = (await commentaries(page)).filter((m) => m.content === "The user cancelled Claude's request. Say only: Cancelled.");
+  check(cancels.length === 2, "a second 'Stop it.' while r1 is stopping: the voice says Cancelled again", `${cancels.length} cancel commentaries`);
+  const a = await again;
+  check(/^Nothing new yet/.test(a.text), "Claude got nothing new from it (the STOP notice was told once)", firstLine(a.text));
+
+  const closed = await b.tool("call_say", { id: "r1", text: "Stopped the refactor; nothing was changed." });
+  check(/r1/.test(closed) && !closed.startsWith("STOP"), "Claude closes the cancelled request normally", firstLine(closed));
+
+  // With nothing of Claude's running, a bare "stop" is for the voice: the safety net keeps it there.
+  await until(async () => (await reqRows(page)).length === 0, 4000, "the Requests list to empty");
+  const idle = timed(b.tool("call_next", { wait_seconds: 12 }));
+  await userSays(page, "Stop.");
+  const i = await idle;
+  check(/^Nothing new yet/.test(i.text), "a bare 'Stop.' with nothing running is not handed to Claude", firstLine(i.text));
+  check(requests(b).length === 1, "still exactly one request", JSON.stringify(requests(b)));
+});
+
+def(15, "permission banner from the Notification hook, then the live activity line", async ({ b, page, check, ctx, info }) => {
+  const r1 = await delegate(b, page, "Delete the build folder.", "del_s15");
+  check(/^REQUEST r1 /.test(r1.text), "r1 is in flight", firstLine(r1.text));
+  await until(async () => (await reqRows(page)).length === 1, 4000, "r1 in the Requests list");
+  const NOTICE = "Claude needs your permission to use Bash (the approval is on screen in Claude's window)";
+  const n = await hookPost(b, "/notify", { text: NOTICE, kind: "permission" });
+  check(n.status === 200, "POST /notify with the hook token and kind permission", `${n.status} ${JSON.stringify(n.json)}`);
+  const banner = await until(() => page.evaluate(() => {
+    const box = document.getElementById("permBox");
+    return !box.hidden && { role: box.getAttribute("role"), text: box.textContent.replace(/\s+/g, " ").trim(), top: box.getBoundingClientRect().top < document.getElementById("statusBox").getBoundingClientRect().top };
+  }), 4000, "the permission banner");
+  const shownAt = Date.now();
+  check(banner.role === "alert" && banner.top, "a banner card with role=alert, above the call status");
+  check(banner.text.includes("Claude is waiting for your approval in its own window") && banner.text.includes(NOTICE)
+    && banner.text.includes("The call cannot approve this. Switch to the Claude window to allow or deny it."), "it says what is happening and what to do", banner.text.slice(0, 200));
+  const st = await status(page);
+  check(/^Claude is waiting for your approval in its own window\./.test(st), "the status line says the same", st);
+
+  /* The async PreToolUse hook of the very step that needs the approval posts its line at about the
+     same moment as the notice: that one must not take the banner down. */
+  const a = await hookPost(b, "/activity", { tool: "Bash", summary: "rm -rf build ZEBRA15" });
+  if (a.status === 404) {
+    info("activity skipped: this bridge has no POST /activity (F6 not built)");
+    info("screenshots: " + await shots(page, "banner", "#permBox"));
+    await b.tool("call_say", { id: "r1", text: "Waiting for your approval in the Claude window.", final: false });
+  } else {
+    check(a.status === 200, "POST /activity with the hook token", `${a.status} ${JSON.stringify(a.json)}`);
+    const row = await until(async () => { const rows = await reqRows(page); return rows[0] && rows[0].now && rows[0]; }, 4000, "the Now: line");
+    check(row.now === "Now: Bash · rm -rf build ZEBRA15" && row.steps === "Steps so far (1)", "the working request shows 'Now: ...' and Steps so far", `${row.now} / ${row.steps}`);
+    const age = Date.now() - shownAt;
+    if (age < 2500) check(!(await page.evaluate(() => document.getElementById("permBox").hidden)), "the step that lands with the notice leaves the banner up", `${age}ms after it`);
+    else info(`banner race check skipped: the step landed ${age}ms after the banner (grace is 3000ms)`);
+    info("screenshots: " + await shots(page, "banner", "#permBox"));
+    info("screenshots: " + await shots(page, "activity", "#statusBox"));
+    await sleep(Math.max(0, shownAt + 3300 - Date.now()));
+    await hookPost(b, "/activity", { tool: "Read", summary: "package.json" });
+    const row2 = await until(async () => { const rows = await reqRows(page); return rows[0] && rows[0].steps === "Steps so far (2)" && rows[0]; }, 4000, "the second step");
+    check(row2.now === "Now: Read · package.json" && row2.stepItems === 2, "the Now line follows the newest step; the list keeps both", `${row2.now} (${row2.stepItems} steps)`);
+    const leaked = await leaks(page, ["rm -rf", "ZEBRA15", "package.json"]);
+    check(leaked.length === 0, "no activity reached the voice", leaked.join(" | ") || "none");
+
+    // A reopened page (a second tab here; a reload ends a live call) gets the steps so far, each once.
+    const tab = await ctx.newPage();
+    const tabErrors = [];
+    tab.on("pageerror", (e) => tabErrors.push(e.message));
+    await tab.goto(page.url(), { waitUntil: "domcontentloaded" });
+    const again = await until(async () => { const rows = await reqRows(tab); return rows[0] && rows[0].steps && rows[0]; }, 5000, "the reopened page's Steps so far");
+    await sleep(500);   // its hello lands too, carrying the same steps
+    const settled = (await reqRows(tab))[0];
+    check(again.now === "Now: Read · package.json" && settled.steps === "Steps so far (2)" && settled.stepItems === 2,
+      "a reopened page shows the steps so far, each once", `${again.now} / ${settled.steps} / ${settled.stepItems} item(s)`);
+    check(tabErrors.length === 0, "no errors in the reopened page", tabErrors.join(" | ") || "none");
+    await tab.close();
+  }
+  const hidden = await until(() => page.evaluate(() => document.getElementById("permBox").hidden), 4000, "the banner to hide once Claude moves again");
+  check(hidden, "the banner hides on the next activity or say");
+  check(JSON.parse(await b.tool("call_status")).state === "live", "the call is still live");
+});
+
+def(16, "phone width: nothing scrolls the page sideways at 390 and 360, and nothing interactive overlaps", async ({ b, page, check, info }) => {
+  await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
+  const r1 = await delegate(b, page, "Show me the long config.", "del_s16");
+  check(/^REQUEST r1 /.test(r1.text), "r1 is in flight", firstLine(r1.text));
+  const LONG = path.join(scratch(b, "phone"), "a-very-long-file-name-that-keeps-going-" + "x".repeat(60) + ".log");
+  fs.writeFileSync(LONG, "log\n");
+  await (await page.$("#fileInput")).uploadFile(LONG);
+  await until(async () => (await readyChips(page)).length === 1, 8000, "the long-named chip");
+  const cols = Array.from({ length: 10 }, (_, k) => "Column" + k + "Header");
+  const display = [
+    "## Long things",
+    FENCE + "js",
+    "const config = " + JSON.stringify({ key: "v".repeat(300) }) + ";",
+    FENCE,
+    "",
+    "| " + cols.join(" | ") + " |",
+    "|" + " --- |".repeat(10),
+    "| " + cols.map((c, k) => "value-" + "w".repeat(24) + k).join(" | ") + " |",
+    "",
+    "A long link: https://example.com/" + "segment/".repeat(30),
+    "",
+    "Unbroken: " + "z".repeat(240),
+  ].join("\n");
+  await b.tool("call_say", { id: "r1", text: "The config is on your screen.", final: false, display });
+  await until(async () => (await screenPos(page)) === "1 of 1", 5000, "the On screen card");
+  for (const [w, h] of [[390, 844], [360, 740]]) {
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: 2 });
+    await sleep(300);
+    const m = await page.evaluate(() => {
+      const pre = document.querySelector("#screenBody pre"), tw = document.querySelector("#screenBody .tablewrap");
+      return { sw: document.documentElement.scrollWidth, iw: innerWidth, pre: pre.scrollWidth > pre.clientWidth, table: tw.scrollWidth > tw.clientWidth };
+    });
+    check(m.sw <= m.iw, `at ${w} px the page does not scroll sideways`, `scrollWidth ${m.sw} vs innerWidth ${m.iw}`);
+    check(m.pre && m.table, `at ${w} px the long code line and the wide table scroll inside their own boxes`, JSON.stringify(m));
+    const o = await overlaps(page);
+    check(o.length === 0, `at ${w} px no two interactive elements overlap`, o.join(" | ") || "none");
+  }
+  await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
+  await sleep(300);
+  fs.mkdirSync(OUT, { recursive: true });
+  await page.screenshot({ path: path.join(OUT, "phone-page-390.png"), fullPage: true });
+  info("screenshot: test/e2e/out/phone-page-390.png (full page)");
+  await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 1 });
+});
+
+def(17, "files that never went with a request: a stopped queued request, then the bridge ends the call", async ({ b, page, check }) => {
+  const dir = scratch(b, "left");
+  const Q = path.join(dir, "queued-notes.txt"), L = path.join(dir, "left-behind.txt");
+  fs.writeFileSync(Q, "queued ZEBRA17\n");
+  fs.writeFileSync(L, "left ZEBRA17\n");
+  const r1 = await delegate(b, page, "Run the linter.", "del_s17");
+  check(/^REQUEST r1 /.test(r1.text), "r1 is in flight", firstLine(r1.text));
+  const input = await page.$("#fileInput");
+  await input.uploadFile(Q);
+  await until(async () => (await readyChips(page)).length === 1, 8000, "the queued-notes chip");
+  await page.type("#typed", "Look at these notes too.");
+  await page.keyboard.press("Enter");
+  const rows = await until(async () => { const r = await reqRows(page); return r.length === 2 && r; }, 5000, "r2 queued with its file");
+  check(/^r2 · queued · Look at these notes too\. · 1 file\(s\)$/.test(rows[1].label), "the queued row says it carries a file", rows[1].label);
+  await sleep(800);
+  await page.click('button[aria-label="Stop request r2"]');
+  const took = await until(async () => (await logLines(page)).find((l) => /^took r2 out of the queue/.test(l.text)), 5000, "the queue note");
+  check(/The 1 file\(s\) with it were not sent; Claude gets them in the end-of-call hand-off$/.test(took.text), "the log says the file that went with r2 was not sent", took.text);
+
+  await input.uploadFile(L);
+  await until(async () => (await readyChips(page)).some((c) => c.startsWith("left-behind.txt · ")), 8000, "the left-behind chip");
+  // The bridge ends the call by itself (as at the time limit) while the page still listens.
+  const st = await page.evaluate(async () => (await fetch(location.pathname.replace(/\/+$/, "") + "/state", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state: "closed", reason: "test: the bridge ended the call" }),
+  })).status);
+  check(st === 200, "the bridge ended the call", `POST /state closed answered ${st}`);
+  const NOTE = "1 file(s) you attached did not go with a request: left-behind.txt. Claude gets them in the end-of-call hand-off.";
+  await until(async () => (await logLines(page)).some((l) => l.text === NOTE), 4000, "the page to say the file did not go");
+  await until(async () => (await sent(page)).some((m) => m.type === "session.close"), 8000, "the page to close the voice session");
+  await live(page, { type: "session.closed", usage: { seconds: 30 } });
+  await until(async () => (await page.$eval("#go", (el) => el.textContent)) === "Call ended", 4000, "the page to show the call ended");
+  const lines = (await logLines(page)).filter((l) => /left-behind/.test(l.text));
+  check(lines.length === 1 && lines[0].who === "Call", "the page said it once, and never as 'You shared'", lines.map((l) => l.who + ": " + l.text).join(" | "));
+  check((await chipTexts(page)).length === 0, "no chip is left on the ended page");
+
+  const end = await b.tool("call_next", { wait_seconds: 5 });
+  check(/^CALL ENDED \(test: the bridge ended the call\)/.test(end), "call_next reports the end", firstLine(end));
+  const never = sharedPaths(end, "Files the user shared on the call but never sent with a request");
+  check(never.length === 2 && never.every((p) => path.isAbsolute(p) && fs.existsSync(p))
+    && never.some((p) => p.endsWith("queued-notes.txt")) && never.some((p) => p.endsWith("left-behind.txt")),
+  "the hand-off lists both files as never sent, as absolute paths that exist", never.join(" | "));
+  check((await leaks(page, ["queued-notes", "left-behind", "ZEBRA17"])).length === 0, "no file name or content reached the voice");
 });
 
 /* ---------------------------------------------------------------- run -- */

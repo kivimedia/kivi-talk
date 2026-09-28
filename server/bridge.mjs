@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -59,6 +59,17 @@ const BRIDGES_DIR = path.join(DATA_DIR, "bridges");
 const KEEP_TRANSCRIPTS = /^(1|true|yes|on)$/i.test(String(ENV.TTC_KEEP_TRANSCRIPTS || ENV.TTC_OPTION_KEEP_TRANSCRIPTS
   || ENV.CLAUDE_PLUGIN_OPTION_KEEP_TRANSCRIPTS || "").trim());
 const CONFIRM_WAIT_S = num(ENV.TTC_CONFIRM_SECONDS, 110);
+/* What Claude puts on screen and the files that go either way never leave this computer (none of
+   it is sent to OpenAI), so the voice's limits do not apply. These caps only keep one call from
+   filling the disk or the page. */
+const DISPLAY_MAX = 100000;
+const DISPLAY_CUT = "\n\n(cut here; the rest is in the Claude window)";
+const FILE_MAX = 25 * 1024 * 1024;
+const SAY_FILES_MAX = 10;
+const PENDING_MAX = 20;
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
+const UPLOAD_KEEP_MS = 7 * 86400000;
+const NO_MESSAGE = "(no message: the user shared file(s) on the call page)";
 
 function realDir(s) {
   const v = String(s || "").trim();
@@ -155,6 +166,9 @@ function newCall(focus) {
     liveId: null, usage: null,
     timers: new Set(),
     logFile: "",
+    shared: new Map(),          // file token -> { path, name, type, size }: files Claude put on screen
+    uploads: [],                // files the user shared: { id, name, size, type, path, r (the request they went with) }
+    uploadSeq: 0, uploading: 0,
   };
 }
 
@@ -205,11 +219,25 @@ function claudeStatus(c) {
   /* Unanswered work wins over a waiting call_next: Claude can be listening for the next request
      while the last one still runs in the background, and reporting "listening" then would let the
      page hang up for quiet in the middle of the work. */
-  const working = [...c.inFlight.values()].at(-1);
-  if (working) return { claude: "working", on: redactSecrets(working.text), queue: c.queue.length };
-  if (c.waiter) return { claude: "listening", queue: c.queue.length };
-  if (Date.now() - c.lastLoopAt < 15000) return { claude: "listening", queue: c.queue.length };
-  return { claude: "away", queue: c.queue.length };
+  const open = [...c.inFlight.values()];
+  const working = open.filter((r) => !r.cancelled).at(-1) || open.at(-1);
+  const items = requestItems(c);
+  if (working) return { claude: "working", on: redactSecrets(working.text), queue: c.queue.length, items };
+  if (c.waiter) return { claude: "listening", queue: c.queue.length, items };
+  if (Date.now() - c.lastLoopAt < 15000) return { claude: "listening", queue: c.queue.length, items };
+  return { claude: "away", queue: c.queue.length, items };
+}
+
+/* The page's Requests list (each with a Stop button), oldest first. The text is a glance, not a
+   record: redacted and short. "stopping" is work the user cancelled that Claude has not closed. */
+function requestItems(c) {
+  return [...c.inFlight.values(), ...c.queue].sort((a, b) => a.n - b.n).map((r) => ({
+    id: r.id,
+    state: !c.inFlight.has(r.id) ? "queued" : r.cancelled ? "stopping" : "working",
+    text: clip(redactSecrets(r.text), 160),
+    at: r.startedAt || r.at,
+    files: r.files.length,
+  }));
 }
 
 function push(msg) {
@@ -244,6 +272,8 @@ function endCall(reason, usage) {
   c.confirms.clear();
   c.launch = null;
   remember(c, "system", "call ended: " + c.endReason);
+  // Files still waiting stay on disk for the hand-off, but no request will take them now.
+  if (pendingUploads(c).length) push({ type: "attachments", pending: [] });
   push({ type: "end", reason: c.endReason });
   if (c.waiter) { const w = c.waiter; c.waiter = null; w.resolve(endedResult(c)); }
   log(`call ${c.id} ended: ${c.endReason}`);
@@ -268,13 +298,17 @@ function enqueue(c, text, recent, delegationId, source, lines) {
   }
   for (const l of went) markHanded(c, l);
   const r = {
-    id: "r" + (++c.seq),
+    id: "r" + (++c.seq), n: c.seq,
     text: t,
     recent: Array.isArray(recent) ? recent.slice(-12) : [],
     delegationIds: delegationId ? [String(delegationId)] : [],
     source, at: Date.now(),
+    // Whatever the user shared since the last request goes with this one, whoever sent it.
+    files: pendingUploads(c),
   };
-  remember(c, "request", `${r.id}: ${r.text}`);
+  for (const u of r.files) u.r = r;
+  remember(c, "request", `${r.id}: ${r.text}${r.files.length ? ` (with ${r.files.length} file(s) the user shared)` : ""}`);
+  if (r.files.length) pushAttachments(c);
   const ahead = c.queue.length + c.inFlight.size;
   if (c.waiter) {
     const w = c.waiter; c.waiter = null;
@@ -301,9 +335,10 @@ function markHanded(c, said) {
 
 function deliver(c, r) {
   c.inFlight.set(r.id, r);
-  c.lastLoopAt = Date.now();
-  // The page forwards this to OpenAI as quiet context, so a typed secret must not ride along.
-  push({ type: "working", id: r.id, text: redactSecrets(r.text), delegationIds: r.delegationIds });
+  r.startedAt = c.lastLoopAt = Date.now();
+  /* The page forwards this to OpenAI as quiet context, so a typed secret must not ride along, and
+     neither does anything about the files but how many. */
+  push({ type: "working", id: r.id, text: redactSecrets(r.text), delegationIds: r.delegationIds, files: r.files.length });
   pushStatus();
   const convo = r.recent
     .map((l) => `${l.role === "user" ? "User" : "Voice"}: ${String(l.text || "").slice(0, 600)}`)
@@ -313,15 +348,17 @@ function deliver(c, r) {
   const how = r.source === "typed" ? "typed on the call page"
     : r.source === "overheard" ? "spoken by the user, transcribed, so words can be misheard; the voice did not hand this over, it may have answered on its own"
     : "spoken by the user, transcribed, so words can be misheard";
+  const files = r.files.map((u) => `- ${u.path} (${u.type}, ${humanSize(u.size)})`);
   return text([
     `REQUEST ${r.id} (${how}):`,
     `"${r.text.replace(/"/g, "'")}"`,
+    ...(files.length ? ["Files the user shared with this request (use your Read tool; images show you the picture):", ...files] : []),
     convo ? `\nRecent conversation on the call (context only: lines marked Voice are the voice model, not the user):\n${convo}` : "",
     r.source === "overheard"
       ? "\nThe voice kept this to itself instead of passing it to you. If it already answered (see the conversation above), check that answer and correct anything it got wrong; either way, do what the user asked. If the voice's answer was right and there is nothing to do or add (small talk), close it with call_say and quiet=true, so nothing is said twice."
       : "",
     "",
-    `Do this now, as if the user had typed it here. When you have the answer, call call_say with id "${r.id}" and a short spoken answer: one to three plain sentences, no markdown, no code.`,
+    `Do this now, as if the user had typed it here. When you have the answer, call call_say with id "${r.id}": answer out loud in 1-3 plain sentences, and put code, commands, file paths, links, tables, lists and anything longer on screen with \`display\` (and screenshots or files with \`files\`).`,
     "If it will take more than about 15 seconds, first call call_say with final=false and a one-line progress note.",
     "Before anything destructive or outward-facing, call call_confirm with the exact action and do it only if it comes back APPROVED.",
     "Then call call_next again.",
@@ -365,7 +402,8 @@ function conversation(c, budget) {
     } else if (l.role === "voice") add(at + "Voice: " + clip(l.text, 600));
     else if (l.role === "request") add(at + "-> handed to you as " + clip(l.text, 300));
     else if (l.role === "claude") add(at + (l.text.startsWith("(progress) ") ? "Claude (progress): " + clip(l.text.slice(11), 4000) : "Claude: " + clip(l.text, 4000)));
-    else if (/^(confirmation |instruction to the voice)/.test(l.text)) add(at + "(" + clip(l.text, 400) + ")");
+    // A cancel stays in: after the call, a cancelled request must not read as work still to do.
+    else if (/^(confirmation |instruction to the voice|the user cancelled )/.test(l.text)) add(at + "(" + clip(l.text, 400) + ")");
   }
   let total = items.reduce((n, i) => n + i.t, 0), dropped = 0;
   // Over budget: first shorten every long line, then drop the oldest, never a line that did not
@@ -409,7 +447,8 @@ function endedResult(c) {
      approval the hang-up cut off still needs a yes. Say which is which. */
   const open = capLines([...c.inFlight.values(), ...c.queue].map((r) => `${r.id} "${clip(r.text, 600).replace(/"/g, "'")}"`
     + (r.declined ? ` (the user clicked Decline on "${clip(r.declined, 200).replace(/"/g, "'")}": do not redo that)` : "")
-    + (r.unconfirmed ? ` (the call ended before the user approved "${clip(r.unconfirmed, 200).replace(/"/g, "'")}": ask in this chat first)` : "")),
+    + (r.unconfirmed ? ` (the call ended before the user approved "${clip(r.unconfirmed, 200).replace(/"/g, "'")}": ask in this chat first)` : "")
+    + (r.cancelled ? " (the user cancelled it on the call: do not do it)" : "")),
     3000, "each is in the conversation as a hand-over");
   const head = [
     `CALL ENDED (${c.endReason}). ${mins.toFixed(1)} minutes live, about $${(mins * PRICE_PER_MIN).toFixed(2)} of OpenAI voice time.`,
@@ -420,6 +459,7 @@ function endedResult(c) {
     "3. If the voice told the user something wrong, correct it.",
     "4. Then write the user a short report: what was done on the call, what you did after it, and anything still open.",
     open.length ? `\nHanded to you but not answered on the call: ${open.join(", ")}` : "",
+    uploadsSection(c),
     c.logFile ? `\nTranscript: ${c.logFile}` : "",
   ].filter((s, i) => s || i === 1).join("\n");
   const all = missedLines(c);
@@ -428,6 +468,31 @@ function endedResult(c) {
   const intro = "\n\nThe whole conversation, oldest first. User lines are the user's own words (transcribed speech, so words can be misheard). Voice lines are the voice model: not the user, not you, and it can be wrong. Claude lines are what you said.\n\n";
   const convo = conversation(c, HANDOFF_TOKENS - estimateTokens(head + missed + intro));
   return text(head + missed + (convo ? intro + convo : "\n\nNothing was said on the call."));
+}
+
+/* Uploads outlive the call so the work after it can open them. A file that rode with a request
+   Claude never got (cancelled while it waited) counts as never sent. */
+function uploadsSection(c) {
+  if (!c.uploads.length) return "";
+  const line = (u) => `- ${u.path} (${u.type}, ${humanSize(u.size)})`;
+  const never = c.uploads.filter((u) => !u.r || (u.r.cancelled && !u.r.startedAt));
+  const sent = c.uploads.filter((u) => !never.includes(u));
+  const out = [];
+  if (never.length) {
+    out.push("\nFiles the user shared on the call but never sent with a request (open them with your Read tool if the conversation calls for it):",
+      ...capLines(never.map(line), 1500, "they are all in " + uploadDirPath(c)));
+  }
+  if (sent.length) {
+    out.push("\nFiles the user shared with a request (still on this computer):",
+      ...capLines(sent.map((u) => line(u) + ", with " + u.r.id), 1500, "they are all in " + uploadDirPath(c)));
+  }
+  return out.join("\n");
+}
+
+function humanSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1).replace(/\.0$/, "") + " KB";
+  return (n / 1048576).toFixed(1).replace(/\.0$/, "") + " MB";
 }
 
 /* Anything spoken goes to OpenAI. A key read out loud is a leaked key, and no spoken sentence
@@ -528,6 +593,9 @@ export function voiceInstructions(focus) {
     "- While you wait, stay quiet unless the user speaks. If they ask, say Claude is still working.",
     "- If Claude asks the user something or asks them to confirm an action, ask it clearly, then hand their reply to Claude.",
     "- Never read out a password, API key, token or other secret, even if an answer contains one.",
+    "- Claude can put things on the user's screen, on the call page: code, links, tables, pictures, files. When it says it did, tell the user to look at the call page, and never try to read that content out: you do not have it.",
+    "- The user can share files and screenshots on the call page. You cannot see them; Claude can. Hand anything about them to Claude.",
+    "- If the user cancels while Claude works, the page stops that work; just say \"Cancelled.\"",
     "- Keep every reply short. This is a spoken conversation.",
     "- Listening mode: only when you are told you are in listening mode, do not delegate or reply on a pause alone, however long; the user is dictating and pauses to think. Stay silent until an explicit stop cue (\"go ahead\", \"that's it\", \"over to you\", or a direct question to you), then treat everything said since entering the mode as one turn. Leave the mode after a stop cue or when told to resume normally. Never enter it on your own.",
     LANGUAGE ? `- Speak ${LANGUAGE}.` : "- Reply in the language the user speaks.",
@@ -628,7 +696,9 @@ function sendNote(res, status, title, body) {
  *   3. The page's HttpOnly SameSite=Strict cookie (or, for status and notices only, the hooks'
  *      token). The only way to get the cookie is the one-time launch link.
  * There are no CORS headers anywhere, and every POST must be application/json, which a
- * cross-site form cannot send without a preflight this server never answers. */
+ * cross-site form cannot send without a preflight this server never answers. The one exception
+ * is /upload, which must be application/octet-stream instead: just as impossible for a form, and
+ * a 25 MiB file does not become a 35 MiB JSON string. Shared files (/file) are for the page only. */
 export async function handle(req, res) {
   if (!peerIsMe(req)) return sendJson(res, 403, { error: "this call belongs to another account on this computer" });
   const host = String(req.headers.host || "").toLowerCase();
@@ -686,9 +756,12 @@ export async function handle(req, res) {
     if (sub === "/") return servePage(res, c);
     if (sub === "/events") return serveEvents(req, res, c);
     if (sub === "/status") return sendJson(res, 200, statusObj(c));
+    const file = sub.match(/^\/file\/([A-Za-z0-9_-]{32})$/);
+    if (file && byPage) return serveFile(res, c, file[1]);
     return sendJson(res, 404, { error: "not found" });
   }
   if (req.method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
+  if (sub === "/upload") return postUpload(req, res, c);
   if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
     return sendJson(res, 415, { error: "content-type must be application/json" });
   }
@@ -706,6 +779,8 @@ export async function handle(req, res) {
     case "/notify": return postNotify(res, c, body);
     case "/confirm": return postConfirm(res, c, body);
     case "/mute": return postMute(res, c, body);
+    case "/cancel": return postCancel(res, c, body);
+    case "/attachments/remove": return postRemoveUpload(res, c, body);
     default: return sendJson(res, 404, { error: "not found" });
   }
 }
@@ -777,6 +852,8 @@ function serveEvents(req, res, c) {
   c.sse.add(res);
   if (c.goneTimer) { clearTimeout(c.goneTimer); c.timers.delete(c.goneTimer); c.goneTimer = null; }
   for (const m of c.outbox.splice(0)) res.write(`data: ${JSON.stringify(m)}\n\n`);
+  // A reloaded page lost its chips; the files are still waiting for the next request.
+  if (isOpen(c) && pendingUploads(c).length) res.write(`data: ${JSON.stringify(attachmentsFrame(c))}\n\n`);
   const ka = setInterval(() => { try { res.write(": ka\n\n"); } catch {} }, 15000);
   req.on("close", () => {
     clearInterval(ka);
@@ -930,7 +1007,8 @@ function postDelegate(res, c, body) {
      seconds old) or "nothing to do". Re-sending an older line would run a finished command a
      second time. */
   if (!textSaid) {
-    const pending = [...c.queue, ...c.inFlight.values()].sort((a, b) => a.at - b.at).at(-1);   // the newest
+    // The newest, never one the user cancelled: a stopped request takes nothing new.
+    const pending = [...c.queue, ...c.inFlight.values()].filter((r) => !r.cancelled).sort((a, b) => a.at - b.at).at(-1);
     if (pending && id && Date.now() - pending.at < 20000) {
       pending.delegationIds.push(id);
       return sendJson(res, 200, { id: pending.id, attached: true, ...ackFor(c, pending) });
@@ -957,7 +1035,8 @@ function ackFor(c, r) {
 
 function postTyped(res, c, body) {
   if (!isOpen(c)) return sendJson(res, 409, { error: "the call has ended" });
-  const t = String(body.text || "").trim();
+  // Files with nothing typed are still a request: the user is showing Claude something.
+  const t = String(body.text || "").trim() || (pendingUploads(c).length ? NO_MESSAGE : "");
   if (!t) return sendJson(res, 400, { error: "empty" });
   remember(c, "user", "(typed) " + t);
   const { r, ahead, claudeWaiting } = enqueue(c, t, c.transcript.filter((l) => l.role === "user" || l.role === "voice").slice(-12), null, "typed");
@@ -1003,11 +1082,266 @@ function postMute(res, c, body) {
   return sendJson(res, 200, { ok: true });
 }
 
+/* kind "permission" is a prompt waiting in Claude's own window (the page shows a banner the call
+   cannot act on); "stopped" is the Stop hook giving up on the loop. */
 function postNotify(res, c, body) {
   const t = String(body.text || "").trim().slice(0, 400);
   if (!t || !isOpen(c)) return sendJson(res, 200, { ok: false });
   remember(c, "system", "notice: " + t);
-  push({ type: "notify", text: t });
+  const kind = body.kind === "permission" || body.kind === "stopped" ? body.kind : undefined;
+  push({ type: "notify", text: t, kind });
+  return sendJson(res, 200, { ok: true });
+}
+
+/* Stop, from the page (a button or a spoken "stop"). Queued work simply goes. Work Claude already
+   picked up cannot be interrupted from here (nothing stops a tool call from outside), so it is
+   marked, and Claude hears it at its next call tool, or at once if it is waiting on call_next. */
+function postCancel(res, c, body) {
+  if (!isOpen(c)) return sendJson(res, 409, { error: "the call has ended" });
+  const id = String(body.id || "");
+  const qi = c.queue.findIndex((r) => r.id === id);
+  let r, was;
+  if (qi >= 0) {
+    [r] = c.queue.splice(qi, 1);
+    was = "queued";
+  } else {
+    r = c.inFlight.get(id);
+    if (!r) return sendJson(res, 404, { error: "that request is not open" });
+    if (r.cancelled) return sendJson(res, 200, { ok: true, was: "working" });
+    was = "working";
+  }
+  r.cancelled = true;
+  remember(c, "system", `the user cancelled ${r.id} (${was}) on the call page: ${r.text}`);
+  if (was === "working") {
+    // An approval card for work that no longer exists would ask the user to approve nothing.
+    for (const [kid, pending] of c.confirms) {
+      if (pending.r !== r) continue;
+      c.confirms.delete(kid);
+      pending.resolve(`DECLINED: the user cancelled ${r.id} on the call. Do not do it.`);
+      push({ type: "confirm_done", id: kid, approved: false });
+    }
+    // toolCall puts the STOP notice in front of this.
+    if (c.waiter) { const w = c.waiter; c.waiter = null; w.resolve(text("Then call call_next again.")); }
+  }
+  push({ type: "cancelled", id: r.id, was });
+  pushStatus();
+  return sendJson(res, 200, { ok: true, was });
+}
+
+/* ------------------------------------------------------------- files -- */
+
+/* Content types by extension. A file Claude shows is only ever served as a picture, a PDF, plain
+   text or a download: never as anything a browser would run in this origin. A file the user
+   uploads is described to Claude with its closest real type. */
+const MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+  pdf: "application/pdf", md: "text/markdown", csv: "text/csv", json: "application/json", html: "text/html",
+  htm: "text/html", xml: "application/xml", zip: "application/zip", mp3: "audio/mpeg", wav: "audio/wav",
+  mp4: "video/mp4", mov: "video/quicktime", webm: "video/webm",
+};
+const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+const TEXT_EXT = new Set(("txt md markdown log csv tsv json jsonl ndjson yaml yml toml ini cfg conf xml html htm css scss "
+  + "sass less js mjs cjs jsx ts tsx mts cts py rb go rs java kt kts scala c h cc cpp cxx hpp hh cs php pl pm r lua swift "
+  + "m mm dart sh bash zsh fish ps1 psm1 bat cmd sql graphql gql proto vue svelte astro diff patch gradle mk tf hcl ex exs "
+  + "erl hs clj elm zig").split(" "));
+const extOf = (name) => (String(name).toLowerCase().match(/\.([a-z0-9]{1,10})$/) || [])[1] || "";
+const typeOf = (name) => MIME[extOf(name)] || (TEXT_EXT.has(extOf(name)) ? "text/plain" : "application/octet-stream");
+
+function servedType(name) {
+  const ext = extOf(name);
+  if (IMAGE_EXT.has(ext) || ext === "pdf") return MIME[ext];
+  // html too: shown as its source, never rendered.
+  if (TEXT_EXT.has(ext)) return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+
+/* call_say's files: every one is checked before any is shown, so a bad path is a clear error and
+   never half an answer on screen. */
+function checkFiles(list) {
+  if (list === undefined || list === null) return { files: [] };
+  if (!Array.isArray(list)) return { error: "files must be a list of absolute file paths. Nothing was sent." };
+  if (list.length > SAY_FILES_MAX) return { error: `files can list at most ${SAY_FILES_MAX} files; there were ${list.length}. Nothing was sent.` };
+  const out = [];
+  for (const p of list) {
+    const given = String(p || "");
+    if (!given || !path.isAbsolute(given)) return { error: `"${given}" is not an absolute path. Nothing was sent.` };
+    let real, st;
+    try { real = fs.realpathSync(given); st = fs.statSync(real); }
+    catch { return { error: `${given} does not exist. Nothing was sent.` }; }
+    if (!st.isFile()) return { error: `${given} is not a regular file. Nothing was sent.` };
+    if (st.size > FILE_MAX) return { error: `${given} is over the 25 MiB limit per file (${st.size} bytes). Nothing was sent.` };
+    const name = path.basename(given);
+    out.push({ path: real, name, type: typeOf(name), size: st.size, image: IMAGE_EXT.has(extOf(name)) });
+  }
+  return { files: out };
+}
+
+function showable(d) {
+  if (d === undefined || d === null) return undefined;
+  const s = String(d);
+  if (!s.trim()) return undefined;
+  if (s.length <= DISPLAY_MAX) return s;
+  const cut = /[\uD800-\uDBFF]/.test(s[DISPLAY_MAX - 1]) ? DISPLAY_MAX - 1 : DISPLAY_MAX;   // never half a character
+  return s.slice(0, cut) + DISPLAY_CUT;
+}
+
+/* Only this page can fetch a shared file, and the response can never act as a page of this origin:
+   a sandbox CSP (scripts, forms and same-origin access all off, even for SVG), nosniff, and markup
+   served as text. */
+const FILE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox";
+const rfc5987 = (s) => encodeURIComponent(s).replace(/['()*]/g, (ch) => "%" + ch.charCodeAt(0).toString(16).toUpperCase());
+
+function serveFile(res, c, token) {
+  const f = c.shared.get(token);
+  let st = null;
+  try { st = f ? fs.statSync(f.path) : null; } catch {}
+  if (!st || !st.isFile()) return sendJson(res, 404, { error: f ? "that file is no longer there" : "no such file" });
+  const type = servedType(f.name);
+  const headers = {
+    ...SECURITY_HEADERS,
+    "content-type": type,
+    "content-length": st.size,
+    "content-security-policy": FILE_CSP,
+    "x-content-type-options": "nosniff",
+  };
+  if (type === "application/octet-stream") headers["content-disposition"] = `attachment; filename*=UTF-8''${rfc5987(f.name)}`;
+  res.writeHead(200, headers);
+  // Exactly the size just announced, even if the file grows while it is read.
+  const s = fs.createReadStream(f.path, st.size ? { start: 0, end: st.size - 1 } : {});
+  s.on("error", () => res.destroy());
+  s.pipe(res);
+}
+
+const pendingUploads = (c) => c.uploads.filter((u) => !u.r);
+const attachmentsFrame = (c) => ({ type: "attachments", pending: pendingUploads(c).map((u) => ({ id: u.id, name: u.name, size: u.size, type: u.type })) });
+const pushAttachments = (c) => push(attachmentsFrame(c));
+const uploadDirPath = (c) => path.join(UPLOADS_DIR, c.id);
+
+/* Names the user's own browser sends, so they are only a label: the basename, letters and digits
+   of any script (with their marks), ". _ - space", no leading dot (hidden files), no trailing dot
+   or space (Windows drops them), at most 100 characters with the extension kept. */
+export function safeUploadName(raw) {
+  let s = String(raw || "").split(/[\\/]/).pop().normalize("NFC");
+  s = s.replace(/[^\p{L}\p{N}\p{M}._ -]/gu, "").replace(/^[. ]+/, "").replace(/[. ]+$/, "");
+  const chars = Array.from(s);
+  if (chars.length > 100) {
+    const ext = Array.from((s.match(/\.[\p{L}\p{N}]{1,16}$/u) || [""])[0]);
+    s = chars.slice(0, 100 - ext.length).join("").replace(/[. ]+$/, "") + ext.join("");
+  }
+  return s || "file";
+}
+
+function mimeParam(v) {
+  const s = String(v || "").trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$/.test(s) ? s : "";
+}
+
+// A folder per call, this user's only. It outlives the call; call_start prunes it after a week.
+function uploadDir(c) {
+  const dir = uploadDirPath(c);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch {}
+  return dir;
+}
+
+function pruneUploads() {
+  let names = [];
+  try { names = fs.readdirSync(UPLOADS_DIR); } catch { return; }
+  for (const n of names) {
+    const p = path.join(UPLOADS_DIR, n);
+    try { if (Date.now() - fs.statSync(p).mtimeMs > UPLOAD_KEEP_MS) fs.rmSync(p, { recursive: true, force: true }); } catch {}
+  }
+}
+
+/* The answer to a too-big upload goes out before the rest of the body is read, and the connection
+   closes behind it instead of taking the rest. */
+function refuseBig(res) {
+  res.writeHead(413, { ...SECURITY_HEADERS, "content-type": "application/json; charset=utf-8", connection: "close" });
+  res.end(JSON.stringify({ error: "That file is over the 25 MiB limit." }));
+}
+
+/* A file the user shares on the page: raw bytes, the name in a header. Counted as they arrive and
+   refused the moment they pass the cap, stored as <n>-<safe name> so names never collide. */
+function postUpload(req, res, c) {
+  if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/octet-stream")) {
+    return sendJson(res, 415, { error: "content-type must be application/octet-stream" });
+  }
+  if (!isOpen(c)) return sendJson(res, 409, { error: "the call has ended" });
+  if (pendingUploads(c).length + c.uploading >= PENDING_MAX) {
+    return sendJson(res, 429, { error: `At most ${PENDING_MAX} files can wait for the next request. Send it, or remove one.` });
+  }
+  if (Number(req.headers["content-length"]) > FILE_MAX) return refuseBig(res);
+  let raw = String(req.headers["x-ttc-name"] || "");
+  try { raw = decodeURIComponent(raw); } catch {}
+  const name = safeUploadName(raw);
+  const type = mimeParam(req.headers["x-ttc-type"]) || typeOf(name);
+  let file;
+  try { file = path.join(uploadDir(c), `${++c.uploadSeq}-${name}`); }
+  catch (e) { return sendJson(res, 500, { error: "Could not create the uploads folder: " + e.message }); }
+  const n = c.uploadSeq;
+  c.uploading++;
+  return new Promise((resolve) => {
+    const out = fs.createWriteStream(file, { flags: "wx", mode: 0o600 });
+    let size = 0, clash = false, over = false, ended = false, settled = false, gone = false;
+    const settle = (fn) => {
+      if (settled) return;
+      settled = true;
+      c.uploading--;
+      fn();
+      resolve();
+    };
+    /* A refused or broken upload leaves nothing behind, and the answer waits until that is true.
+       Only a file this upload created is ever removed ("wx" refuses to open one that exists).
+       The first reason to give up is the answer: a stream destroyed in the middle of a write
+       reports an error of its own, which must not turn a 413 into a 500. */
+    const discard = (then) => {
+      if (gone) return;
+      gone = true;
+      const rm = () => (clash ? then() : fs.rm(file, { force: true }, () => then()));
+      if (out.closed) return rm();
+      out.once("close", rm);
+      out.destroy();
+    };
+    out.on("error", (e) => {
+      if (e.code === "EEXIST") clash = true;
+      discard(() => settle(() => sendJson(res, 500, { error: "Could not save the file: " + e.message })));
+    });
+    req.on("data", (chunk) => {
+      if (over || gone || settled) return;
+      size += chunk.length;
+      if (size > FILE_MAX) {
+        over = true;
+        req.pause();
+        discard(() => settle(() => refuseBig(res)));
+        return;
+      }
+      if (!out.write(chunk)) { req.pause(); out.once("drain", () => { if (!over && !gone) req.resume(); }); }
+    });
+    req.on("end", () => {
+      ended = true;
+      if (over || gone || settled) return;
+      out.end(() => settle(() => {
+        if (!isOpen(c)) { fs.rm(file, { force: true }, () => {}); return sendJson(res, 409, { error: "the call has ended" }); }
+        try { fs.chmodSync(file, 0o600); } catch {}
+        const u = { id: "f" + n, name, size, type, path: file, r: null };
+        c.uploads.push(u);
+        pushAttachments(c);
+        sendJson(res, 200, { id: u.id, name, size, type });
+      }));
+    });
+    req.on("error", () => {});
+    // The browser gave up (tab closed, upload cancelled): nothing half-written stays.
+    req.on("close", () => { if (!ended && !over && !settled) discard(() => settle(() => {})); });
+  });
+}
+
+function postRemoveUpload(res, c, body) {
+  if (!isOpen(c)) return sendJson(res, 409, { error: "the call has ended" });
+  const u = pendingUploads(c).find((x) => x.id === String(body.id || ""));
+  if (!u) return sendJson(res, 404, { error: "that file is not waiting to be sent" });
+  c.uploads.splice(c.uploads.indexOf(u), 1);
+  try { fs.unlinkSync(u.path); } catch {}
+  pushAttachments(c);
   return sendJson(res, 200, { ok: true });
 }
 
@@ -1102,11 +1436,13 @@ export const TOOLS = [
   },
   {
     name: "call_say",
-    description: "Say something to the user on the voice call. Use final=true (default) for the answer to a request, final=false for a short progress note while you keep working. Plain spoken sentences only: no markdown, no code, no URLs, never a secret.",
+    description: "Say something to the user on the voice call, and show them what is better read than heard. Use final=true (default) for the answer to a request, final=false for a short progress note while you keep working. text is spoken: plain sentences only, no markdown, no code, no URLs, never a secret. Put code, commands, file paths, links, tables, lists and anything longer in display, and screenshots, images or files in files: both appear on the user's call page and never reach the voice.",
     inputSchema: {
       type: "object",
       properties: {
-        text: { type: "string", description: "What to tell the user, 1-3 short spoken sentences." },
+        text: { type: "string", description: "What to tell the user out loud, 1-3 short spoken sentences. If you also show something, say so (for example \"The diff is on your screen.\")." },
+        display: { type: "string", description: "Optional markdown for the call page's On screen card: code, commands, file paths, links, tables, lists, anything longer than a sentence. Shown exactly as written (so leave secrets out), stays on this computer, never spoken. Up to 100,000 characters." },
+        files: { type: "array", items: { type: "string" }, maxItems: SAY_FILES_MAX, description: "Optional absolute paths of local files to show on the call page: screenshots and images appear as pictures, other files open in a new tab. Up to 10, each a regular file of at most 25 MiB." },
         id: { type: "string", description: "The request id from call_next (for example r3). Defaults to the latest request." },
         final: { type: "boolean", description: "true = this answers the request (default). false = progress note, still working." },
         quiet: { type: "boolean", description: "true = close the request WITHOUT speaking: only for something the voice kept to itself and already answered well (small talk), so the user does not hear it twice." },
@@ -1150,13 +1486,36 @@ export const TOOLS = [
   },
 ];
 
+/* Every call_* result but call_start's and call_status's carries a STOP notice for work the user
+   cancelled that Claude has not heard about yet, so it hears at its very next call tool. Told
+   once. Not once the call has ended: the hand-off says it, and its first line must stay first. */
 async function toolCall(name, args, ctx) {
+  const result = await runTool(name, args, ctx);
+  if (!result || name === "call_start" || name === "call_status" || !call || !isOpen(call)) return result;
+  const said = result.content[0].text;
+  if (said.startsWith("Superseded:")) return result;   // Claude ignores this one, so it cannot carry news
+  const stops = untoldStops(call);
+  return stops ? { ...result, content: [{ type: "text", text: stops + "\n\n" + said }] } : result;
+}
+
+function untoldStops(c) {
+  const lines = [];
+  for (const r of c.inFlight.values()) {
+    if (!r.cancelled || r.told) continue;
+    r.told = true;
+    lines.push(`STOP ${r.id}: the user cancelled "${clip(r.text, 200).replace(/"/g, "'")}" on the call. Stop working on it now. Do not undo what is already done unless they ask. Close it with call_say id "${r.id}": one short line saying it is stopped and what, if anything, was already changed.`);
+  }
+  return lines.join("\n");
+}
+
+async function runTool(name, args, ctx) {
   args = args || {};
   if (name === "call_start") {
     await ensureServer();
     let c = call;
     const reopen = Boolean(c && isOpen(c));
     if (!reopen) {
+      pruneUploads();
       c = call = newCall(args.focus);
       remember(c, "system", `call started${c.focus ? " (focus: " + c.focus + ")" : ""}`);
       later(c, START_GRACE_MIN * 60000, () => {
@@ -1191,11 +1550,13 @@ async function toolCall(name, args, ctx) {
     const action = String(args.action || "").trim().slice(0, 1200);
     const why = speakable(args.why || "").slice(0, 300);
     if (!action) return fail("action is required: the exact thing you want to do.");
+    // The request this approval belongs to, so the end-of-call hand-off can say how it went.
+    const r = [...c.inFlight.values()].at(-1) || null;
+    // Work the user already stopped on the page has nothing left to approve: no card.
+    if (r && r.cancelled) return text(`DECLINED: the user cancelled ${r.id} on the call. Do not do it.`);
     if (!c.sse.size) return text("DECLINED: the call page is not connected, so the user cannot see the action. Do not do it; ask again once the page is back.");
     const id = "k" + crypto.randomBytes(4).toString("hex");
     remember(c, "system", `confirmation ${id} asked: ${action}`);
-    // The request this approval belongs to, so the end-of-call hand-off can say how it went.
-    const r = [...c.inFlight.values()].at(-1) || null;
     return await new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (!c.confirms.has(id)) return;
@@ -1253,19 +1614,31 @@ async function toolCall(name, args, ctx) {
     if (!isOpen(c)) return text("The call has already ended, so nothing was spoken. " + endedResult(c).content[0].text);
     const said = fitSpoken(speakable(args.text));
     if (!said) return fail("Nothing to say: text was empty after removing markdown.");
+    const checked = checkFiles(args.files);
+    if (checked.error) return fail(checked.error);
+    /* What is on screen goes out exactly as written, like the approval card: it is drawn on this
+       computer only (the voice is told only that there is something to look at), and it is what
+       chat would have shown. It is not kept in the transcript. */
+    const display = showable(args.display);
+    const files = checked.files.map((f) => {
+      const token = crypto.randomBytes(24).toString("base64url");
+      c.shared.set(token, f);
+      return { token, name: f.name, type: f.type, size: f.size, image: f.image };
+    });
     const final = args.final !== false;
     /* An explicit id that is no longer in flight (already answered, or never existed) must not
        fall through to closing some OTHER request: it goes out as a plain note. */
     const r = args.id ? (c.inFlight.get(String(args.id)) || null) : ([...c.inFlight.values()].at(-1) || null);
     // Quiet closes a request the voice already handled well: the voice is told, not asked to speak.
     const quiet = final && args.quiet === true;
-    const delivered = push({ type: "say", id: r ? r.id : null, text: said, final, quiet, delegationIds: r ? r.delegationIds : [] });
+    const delivered = push({ type: "say", id: r ? r.id : null, text: said, final, quiet, delegationIds: r ? r.delegationIds : [], display, files });
     remember(c, "claude", (quiet ? "(closed quietly) " : final ? "" : "(progress) ") + said);
     if (final && r) { c.inFlight.delete(r.id); c.lastAnswered = { r, at: Date.now() }; }
     pushStatus();
+    const shown = display || files.length ? ` and shown on screen${files.length ? ` with ${files.length} file(s)` : ""}` : "";
     return text(delivered
-      ? `Sent to the call${r ? ` as the ${final ? "answer to" : "progress on"} ${r.id}` : ""}. Now call call_next.`
-      : "The call page is reconnecting; this will be spoken when it is back. Now call call_next.");
+      ? `Sent to the call${r ? ` as the ${final ? "answer to" : "progress on"} ${r.id}` : ""}${shown}. Now call call_next.`
+      : `The call page is reconnecting; this will be spoken${shown ? " and shown" : ""} when it is back. Now call call_next.`);
   }
 
   if (name === "call_instruct") {

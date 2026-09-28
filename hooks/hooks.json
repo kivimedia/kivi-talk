@@ -1,5 +1,5 @@
 {
-  "description": "kivi-talk: approve only its own call tools, keep the voice loop alive while a call is open, and say permission prompts out loud",
+  "description": "kivi-talk: approve only its own call tools, keep the voice loop alive while a call is open, and say permission prompts out loud (and show them on the call page)",
   "hooks": {
     "PreToolUse": [
       {

@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { startBridge, mockOpenAI, post, sleep } from "./helpers.mjs";
+import { startBridge, mockOpenAI, post, sleep, upload, rawUpload, tmpDir } from "./helpers.mjs";
 import { speakable, redactSecrets, fitSpoken, estimateTokens, peerUidFromTable, instructMode } from "../server/bridge.mjs";
+import * as bridgeMod from "../server/bridge.mjs";
 
 const KEY = "sk-test-" + "x".repeat(40) + "WXYZ";
 
@@ -740,12 +741,14 @@ test("work still in flight reads as 'working' even while a call_next waits (no i
   try {
     await page.post("typed", { text: "long job" });
     await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight
-    const waiting = b.tool("call_next", { wait_seconds: 6 });  // Claude went back to listening early
-    await sleep(150);
-    const st = JSON.parse(await (await page.get("status")).text());
+    const waiting = b.tool("call_next", { wait_seconds: 30 }); // Claude went back to listening early
+    // Read it once the bridge has the wait: a busy machine can take longer than any fixed sleep.
+    let st;
+    for (let i = 0; i < 200 && !(st = await (await page.get("status")).json()).nextPending; i++) await sleep(50);
     assert.equal(st.nextPending, true);
     assert.equal(st.claude, "working", "the page's idle timer must see the job");
-    await waiting;
+    await page.post("state", { state: "closed", reason: "done" });
+    assert.match(await waiting, /^CALL ENDED/);
   } finally { b.stop(); }
 });
 
@@ -852,4 +855,456 @@ test("secrets never reach the voice", () => {
   }
   assert.equal(redactSecrets("I changed two lines in server.js"), "I changed two lines in server.js", "ordinary speech untouched");
   assert.match(speakable("done, key sk-abcdefghijklmnopqrstuvwxyz123456 set"), /\[secret removed\]/);
+});
+
+/* ------------------------------------------------- 0.6.0: rich parity -- */
+
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+const isHello = (f) => f.type === "hello";
+
+async function toolRaw(b, name, args = {}) {
+  const r = await b.rpc("tools/call", { name, arguments: args });
+  return { text: r.result.content.map((c) => c.text).join("\n"), isError: r.result.isError === true };
+}
+
+function hookHeaders(b, page) {
+  const hand = JSON.parse(fs.readFileSync(path.join(b.data, "bridges", new URL(page.base).port + ".json"), "utf8"));
+  return { "x-ttc-hook": hand.hookToken };
+}
+
+const callIdOf = (page) => new URL(page.base).pathname.split("/")[2];
+const uploadsOf = (b, page) => path.join(b.data, "uploads", callIdOf(page));
+
+function transcriptText(b) {
+  const dir = path.join(b.data, "calls");
+  return fs.existsSync(dir) ? fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf8")).join("") : "";
+}
+
+test("0.6.0: version, and call_say takes display and files in its schema", async () => {
+  const b = startBridge();
+  try {
+    const init = await b.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+    assert.equal(init.result.serverInfo.version, "0.6.0");
+    const say = (await b.rpc("tools/list", {})).result.tools.find((t) => t.name === "call_say");
+    assert.equal(say.inputSchema.properties.display.type, "string");
+    assert.equal(say.inputSchema.properties.files.type, "array");
+    assert.equal(say.inputSchema.properties.files.items.type, "string");
+    assert.equal(say.inputSchema.properties.files.maxItems, 10);
+    assert.deepEqual(say.inputSchema.required, ["text"], "the spoken line stays required");
+    assert.match(say.description, /display/);
+  } finally { b.stop(); }
+});
+
+test("call_say display reaches the page verbatim, and never the transcript file", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: "show me the fix" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    const display = "## Fix\n```diff\n- old\n+ new\n```\n| a | b |\n|---|---|\n| 1 | 2 |\n\nset DB_PASSWORD=hunter2hunter2 <img src=x onerror=alert(1)>";
+    const progress = await b.tool("call_say", { id: "r1", text: "Working, the plan is on screen.", final: false, display });
+    assert.match(progress, /progress on r1 and shown on screen\./);
+    const first = await events.waitFor((f) => f.type === "say" && !f.final);
+    assert.equal(first.display, display, "not redacted, not stripped of markdown");
+    assert.deepEqual(first.files, []);
+    await b.tool("call_say", { id: "r1", text: "Done, the **diff** is on your screen.", display: "x".repeat(100050) });
+    const last = await events.waitFor((f) => f.type === "say" && f.final);
+    assert.equal(last.text, "Done, the diff is on your screen.", "the spoken line is still made speakable");
+    assert.equal(last.display, "x".repeat(100000) + "\n\n(cut here; the rest is in the Claude window)");
+    await page.post("typed", { text: "hi" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await b.tool("call_say", { id: "r2", text: "Hi.", quiet: true, display: "a quiet table" });
+    assert.equal((await events.waitFor((f) => f.type === "say" && f.quiet)).display, "a quiet table");
+    await b.tool("call_say", { text: "No display here." });
+    assert.equal((await events.waitFor((f) => f.type === "say" && f.text === "No display here.")).display, undefined);
+    const t = transcriptText(b);
+    assert.match(t, /Working, the plan is on screen\./);
+    assert.doesNotMatch(t, /## Fix|hunter2|onerror|quiet table|xxxxxxxxxx/, "what is on screen is not written to disk");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("call_say files are all checked first: one missing path, folder or big file fails and nothing is pushed", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  const dir = tmpDir("share");
+  const png = path.join(dir, "shot.png");
+  fs.writeFileSync(png, PNG);
+  const big = path.join(dir, "big.log");
+  fs.writeFileSync(big, "");
+  fs.truncateSync(big, 25 * 1024 * 1024 + 1);
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: "show me" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    const bad = [
+      [[png, path.join(dir, "missing.png")], /missing\.png/],
+      [[png, dir], /not a regular file/],
+      [[big], /big\.log[\s\S]*25 MiB/],
+      [["shot.png"], /absolute/],
+      [Array(11).fill(png), /at most 10/],
+      ["not a list", /list/],
+    ];
+    for (const [files, why] of bad) {
+      const r = await toolRaw(b, "call_say", { id: "r1", text: "Here.", files });
+      assert.equal(r.isError, true, `refused: ${JSON.stringify(files).slice(0, 80)}`);
+      assert.match(r.text, why);
+    }
+    await sleep(100);
+    assert.ok(!events.frames.some((f) => f.type === "say"), "nothing was pushed");
+    assert.deepEqual(JSON.parse(await b.tool("call_status")).inFlight.map((r) => r.id), ["r1"], "the request is still open");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("GET /file serves a shared file to the page only, sandboxed, typed by its extension", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  const dir = tmpDir("share");
+  const f = (n, body) => { const p = path.join(dir, n); fs.writeFileSync(p, body); return p; };
+  const files = [f("shot.png", PNG), f("notes.md", "# hi"), f("page.html", "<script>alert(1)</script>"),
+    f("pic.svg", '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+    f("blob.bin", Buffer.from([0, 1, 2])), f("doc.pdf", "%PDF-1.4")];
+  try {
+    await events.waitFor(isHello);
+    const out = await b.tool("call_say", { text: "Look at these.", files });
+    assert.match(out, /and shown on screen with 6 file\(s\)\./);
+    const say = await events.waitFor((x) => x.type === "say");
+    assert.deepEqual(say.files.map((x) => [x.name, x.image, x.size]),
+      files.map((p) => [path.basename(p), /\.(png|svg)$/.test(p), fs.statSync(p).size]));
+    assert.equal(say.files[0].type, "image/png");
+    for (const x of say.files) assert.match(x.token, /^[A-Za-z0-9_-]{32}$/);
+    const get = (name) => page.get("file/" + say.files.find((x) => x.name === name).token);
+
+    const png = await get("shot.png");
+    assert.equal(png.status, 200);
+    assert.equal(png.headers.get("content-type"), "image/png");
+    assert.equal(png.headers.get("content-security-policy"), "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox");
+    assert.equal(png.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(png.headers.get("x-frame-options"), "DENY");
+    assert.deepEqual(Buffer.from(await png.arrayBuffer()), PNG);
+    const types = { "notes.md": "text/plain; charset=utf-8", "page.html": "text/plain; charset=utf-8",
+      "pic.svg": "image/svg+xml", "doc.pdf": "application/pdf", "blob.bin": "application/octet-stream" };
+    for (const [n, t] of Object.entries(types)) {
+      const r = await get(n);
+      assert.equal(r.status, 200, n);
+      assert.equal(r.headers.get("content-type"), t, n);
+      assert.match(r.headers.get("content-security-policy"), /; sandbox$/, `${n} is sandboxed`);
+      assert.equal(r.headers.get("content-disposition"), n === "blob.bin" ? "attachment; filename*=UTF-8''blob.bin" : null, n);
+      await r.arrayBuffer();
+    }
+    const token = say.files[0].token;
+    assert.equal((await fetch(page.base + "file/" + token)).status, 403, "no cookie, no file");
+    assert.equal((await fetch(page.base + "file/" + token, { headers: hookHeaders(b, page) })).status, 403, "the hook token never reads files");
+    assert.equal((await page.get("file/" + "A".repeat(32))).status, 404, "unknown token");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("upload names keep letters and digits of any script, and nothing that can walk out or hide", () => {
+  const n = bridgeMod.safeUploadName;
+  assert.equal(typeof n, "function");
+  assert.equal(n("../../evil"), "evil");
+  assert.equal(n("..\\..\\win.ini"), "win.ini");
+  assert.equal(n(".bashrc"), "bashrc");
+  assert.equal(n("דוח שנתי 2026.pdf"), "דוח שנתי 2026.pdf");
+  assert.equal(n("a<b>c:d|e?f*g\"h$i.png"), "abcdefghi.png");
+  assert.equal(n("x".repeat(150) + ".png"), "x".repeat(96) + ".png", "cut to 100, keeping the extension");
+  assert.equal(n(""), "file");
+  assert.equal(n("..."), "file");
+  assert.equal(n("a/"), "file");
+});
+
+test("uploads: octet-stream from the page only, saved under a safe name in the call's own folder", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    const dir = uploadsOf(b, page);
+    const r = await upload(page, "../../evil", "payload", { type: "text/plain" });
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(r.json, { id: "f1", name: "evil", size: 7, type: "text/plain" });
+    assert.deepEqual(fs.readdirSync(dir), ["1-evil"]);
+    assert.equal(fs.readFileSync(path.join(dir, "1-evil"), "utf8"), "payload");
+    assert.ok(!fs.existsSync(path.join(b.data, "evil")) && !fs.existsSync(path.join(b.data, "uploads", "evil")));
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+      assert.equal(fs.statSync(path.join(dir, "1-evil")).mode & 0o777, 0o600);
+    }
+    const att = await events.waitFor((f) => f.type === "attachments");
+    assert.deepEqual(att.pending, [{ id: "f1", name: "evil", size: 7, type: "text/plain" }]);
+    assert.equal((await page.post("upload", { name: "x" })).status, 415, "JSON is not an upload");
+    assert.equal((await upload(page, "a.txt", "x", { headers: { "content-type": "text/plain" } })).status, 415);
+    assert.equal((await upload(page, "a.txt", "x", { headers: { origin: "https://attacker.example" } })).status, 403);
+    assert.equal((await upload(page, "a.txt", "x", { headers: { cookie: "" } })).status, 403);
+    assert.equal((await upload(page, "a.txt", "x", { headers: { cookie: "", ...hookHeaders(b, page) } })).status, 403, "hooks cannot upload");
+    assert.deepEqual(fs.readdirSync(dir), ["1-evil"], "no refused upload wrote anything");
+    // Every other POST still insists on JSON.
+    const form = await fetch(page.base + "typed", { method: "POST", headers: { cookie: page.cookie, "content-type": "application/octet-stream" }, body: "x" });
+    assert.equal(form.status, 415);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("an upload over 25 MiB gets 413 without being read to the end, and leaves nothing behind", async () => {
+  const { b, page } = await started();
+  try {
+    const h = { cookie: page.cookie, "content-type": "application/octet-stream", "x-ttc-name": "big.bin" };
+    const declared = await rawUpload(page.base + "upload", h, { declared: 25 * 1024 * 1024 + 1, bytes: 64 * 1024 });
+    assert.equal(declared.status, 413, JSON.stringify(declared));
+    const streamed = await rawUpload(page.base + "upload", h, { bytes: 25 * 1024 * 1024 + 1 });
+    assert.equal(streamed.status, 413, JSON.stringify(streamed));
+    const dir = uploadsOf(b, page);
+    assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], "no half-written file");
+    const ok = await upload(page, "small.txt", "ok");
+    assert.equal(ok.status, 200, "the call still takes uploads");
+    assert.deepEqual(fs.readdirSync(dir).map((f) => f.replace(/^\d+-/, "")), ["small.txt"]);
+    assert.deepEqual(JSON.parse(await b.tool("call_status")).items, []);
+  } finally { b.stop(); }
+});
+
+test("at most 20 uploads wait at once, remove deletes one, and an ended call takes none", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    const dir = uploadsOf(b, page);
+    for (let i = 1; i <= 20; i++) assert.equal((await upload(page, `f${i}.txt`, "x")).status, 200);
+    assert.equal((await upload(page, "f21.txt", "x")).status, 429);
+    assert.equal(fs.readdirSync(dir).length, 20);
+    const rm = await page.post("attachments/remove", { id: "f3" });
+    assert.equal(rm.status, 200);
+    assert.deepEqual(rm.json, { ok: true });
+    assert.ok(!fs.existsSync(path.join(dir, "3-f3.txt")), "the file is deleted");
+    const after = await events.waitFor((f) => f.type === "attachments" && f.pending.length === 19 && !f.pending.some((p) => p.id === "f3"));
+    assert.deepEqual(after.pending.map((p) => p.id), Array.from({ length: 20 }, (_, i) => "f" + (i + 1)).filter((id) => id !== "f3"));
+    assert.equal((await page.post("attachments/remove", { id: "f3" })).status, 404);
+    assert.equal((await upload(page, "again.txt", "x")).status, 200, "room for one more");
+    await page.post("state", { state: "closed", reason: "bye" });
+    assert.equal((await upload(page, "late.txt", "x")).status, 409);
+    await events.waitFor((f) => f.type === "attachments" && f.pending.length === 0);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("pending uploads ride with the next request, typed or spoken; Claude gets the paths, the voice never does", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    const dir = uploadsOf(b, page);
+    await upload(page, "screen shot.png", PNG, { type: "image/png" });
+    await page.post("typed", { text: "what is wrong in this screenshot" });
+    await events.waitFor((f) => f.type === "attachments" && f.pending.length === 0);
+    const got = await b.tool("call_next", { wait_seconds: 5 });
+    const abs = path.join(dir, "1-screen shot.png");
+    assert.ok(path.isAbsolute(abs));
+    assert.match(got, /^REQUEST r1 \(typed on the call page\):\n"what is wrong in this screenshot"\nFiles the user shared with this request \(use your Read tool; images show you the picture\):\n/);
+    assert.ok(got.includes(`\n- ${abs} (image/png, ${PNG.length} B)\n`), got);
+    assert.match(got, /answer out loud in 1-3 plain sentences, and put code, commands, file paths, links, tables, lists and anything longer on screen with `display` \(and screenshots or files with `files`\)/);
+    const working = await events.waitFor((f) => f.type === "working" && f.id === "r1");
+    assert.equal(working.files, 1);
+    await upload(page, "log.txt", "error at line 3");
+    await page.post("delegate", { delegation_id: "d1", said: ["and read this log"], recent: [] });
+    const got2 = await b.tool("call_next", { wait_seconds: 5 });
+    assert.ok(got2.includes(`- ${path.join(dir, "2-log.txt")} (text/plain, 15 B)`), got2);
+    assert.doesNotMatch(got2, /screen shot/, "each file goes with one request only");
+    await upload(page, "notes.md", "n");
+    await page.post("delegate", { delegation_id: null, source: "overheard", said: ["hmm look at that"], recent: [] });
+    assert.ok((await b.tool("call_next", { wait_seconds: 5 })).includes(path.join(dir, "3-notes.md")), "overheard speech takes them too");
+    // What the page forwards to OpenAI: the working frame text and the Claude line. No name, no path.
+    const forwarded = JSON.stringify(events.frames.filter((f) => f.type === "working" || f.type === "status").map((f) => [f.text, f.on, f.items]));
+    assert.doesNotMatch(forwarded, /screen shot|log\.txt|notes\.md|uploads/);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("an empty typed message is a request only when files are waiting", async () => {
+  const { b, page } = await started();
+  try {
+    assert.equal((await page.post("typed", { text: "  " })).status, 400);
+    await upload(page, "a.pdf", "%PDF");
+    assert.equal((await page.post("typed", { text: "" })).status, 200);
+    const got = await b.tool("call_next", { wait_seconds: 5 });
+    assert.match(got, /^REQUEST r1 \(typed on the call page\):\n"\(no message: the user shared file\(s\) on the call page\)"/);
+    assert.match(got, /1-a\.pdf \(application\/pdf, 4 B\)/);
+    assert.equal((await page.post("typed", { text: "" })).status, 400, "the file already went with r1");
+  } finally { b.stop(); }
+});
+
+test("the end-of-call hand-off lists every upload, sent with a request or never sent, and they outlive the call", async () => {
+  const { b, page } = await started();
+  try {
+    const dir = uploadsOf(b, page);
+    await upload(page, "sent.png", PNG);
+    await page.post("typed", { text: "look" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await b.tool("call_say", { id: "r1", text: "Seen." });
+    await upload(page, "left.csv", "a,b");
+    await page.post("state", { state: "closed", reason: "bye" });
+    const end = await b.tool("call_next", { wait_seconds: 5 });
+    assert.match(end, /^CALL ENDED \(bye\)/);
+    const never = end.indexOf("never sent with a request");
+    assert.ok(never > 0, end);
+    assert.ok(end.includes(`- ${path.join(dir, "2-left.csv")} (text/csv, 3 B)`), end);
+    assert.ok(end.includes(`- ${path.join(dir, "1-sent.png")} (image/png, ${PNG.length} B), with r1`), end);
+    assert.ok(fs.existsSync(path.join(dir, "2-left.csv")) && fs.existsSync(path.join(dir, "1-sent.png")));
+  } finally { b.stop(); }
+});
+
+test("upload folders older than 7 days are removed at the next call_start", async () => {
+  const b = startBridge();
+  try {
+    const old = path.join(b.data, "uploads", "aaaaaaaaaaaa");
+    const fresh = path.join(b.data, "uploads", "bbbbbbbbbbbb");
+    for (const d of [old, fresh]) { fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, "1-x.txt"), "x"); }
+    const t = (Date.now() - 8 * 86400000) / 1000;
+    fs.utimesSync(path.join(old, "1-x.txt"), t, t);
+    fs.utimesSync(old, t, t);
+    await b.init();
+    await b.tool("call_start", {});
+    assert.ok(!fs.existsSync(old), "a week-old folder is gone");
+    assert.ok(fs.existsSync(path.join(fresh, "1-x.txt")), "a recent one stays");
+  } finally { b.stop(); }
+});
+
+test("hello and status list the open requests oldest first, with state, redacted text and file count", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await upload(page, "a.txt", "x");
+    await page.post("typed", { text: "first job with DB_PASSWORD=hunter2hunter2 " + "y".repeat(300) });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 working
+    await page.post("typed", { text: "second job" });           // r2 queued
+    await page.post("typed", { text: "third job" });            // r3 queued
+    const st = await events.waitFor((f) => f.type === "status" && (f.items || []).length === 3);
+    assert.deepEqual(st.items.map((i) => [i.id, i.state, i.files]), [["r1", "working", 1], ["r2", "queued", 0], ["r3", "queued", 0]]);
+    assert.doesNotMatch(st.items[0].text, /hunter2/);
+    assert.ok(st.items[0].text.length <= 163, "clipped");
+    assert.ok(st.items.every((i) => Number.isFinite(i.at) && i.at > 1.7e12));
+    await page.post("cancel", { id: "r1" });
+    const stopping = await events.waitFor((f) => f.type === "status" && (f.items || []).some((i) => i.state === "stopping"));
+    assert.deepEqual(stopping.items.map((i) => i.state), ["stopping", "queued", "queued"]);
+    const again = page.sse();
+    const hello = await again.waitFor(isHello);
+    assert.deepEqual(hello.items.map((i) => [i.id, i.state]), [["r1", "stopping"], ["r2", "queued"], ["r3", "queued"]]);
+    await again.close();
+  } finally { await events.close(); b.stop(); }
+});
+
+test("cancelling a queued request removes it: it is never delivered, and the record says so", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: "delete the build folder" });
+    const r = await page.post("cancel", { id: "r1" });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: true, was: "queued" });
+    const frame = await events.waitFor((f) => f.type === "cancelled");
+    assert.deepEqual(frame, { type: "cancelled", id: "r1", was: "queued" });
+    assert.equal(JSON.parse(await b.tool("call_status")).queued.length, 0, "never delivered");
+    assert.equal((await page.post("cancel", { id: "r1" })).status, 404);
+    const unknown = await page.post("cancel", { id: "r99" });
+    assert.equal(unknown.status, 404);
+    assert.deepEqual(unknown.json, { error: "that request is not open" });
+    assert.match(transcriptText(b), /the user cancelled r1/);
+    await page.post("state", { state: "closed", reason: "bye" });
+    const end = await b.tool("call_next", { wait_seconds: 5 });
+    assert.doesNotMatch(end, /Handed to you but not answered/);
+    assert.match(end, /\(the user cancelled r1[^\n]*delete the build folder/, "the hand-off says not to do it after the call");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("cancelling work in flight: Claude is told once, at its next call tool, and closes it with call_say", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: 'rename "src" to lib' });
+    await b.tool("call_next", { wait_seconds: 5 });
+    const r = await page.post("cancel", { id: "r1" });
+    assert.deepEqual(r.json, { ok: true, was: "working" });
+    await events.waitFor((f) => f.type === "cancelled" && f.id === "r1" && f.was === "working");
+    assert.doesNotMatch(await b.tool("call_status"), /STOP/, "call_status is not where Claude is told");
+    const note = await b.tool("call_say", { id: "r1", text: "Still renaming.", final: false });
+    assert.match(note, /^STOP r1: the user cancelled "rename 'src' to lib" on the call\. Stop working on it now\. Do not undo what is already done unless they ask\. Close it with call_say id "r1": one short line saying it is stopped and what, if anything, was already changed\.\n\nSent to the call/);
+    const done = await b.tool("call_say", { id: "r1", text: "Stopped. Nothing was renamed." });
+    assert.doesNotMatch(done, /STOP/, "told once");
+    assert.match(done, /answer to r1/, "a cancelled request closes normally");
+    assert.equal(JSON.parse(await b.tool("call_status")).inFlight.length, 0);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("a call_next waiting when in-flight work is cancelled returns at once with the STOP notice", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "long job" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight
+    const waiting = b.tool("call_next", { wait_seconds: 30 });
+    // Cancel only once the bridge has the wait, or this would test a call_next that came later.
+    for (let i = 0; i < 200 && !(await (await page.get("status")).json()).nextPending; i++) await sleep(50);
+    const t0 = Date.now();
+    await page.post("cancel", { id: "r1" });
+    const got = await waiting;
+    assert.ok(Date.now() - t0 < 3000, "not after the wait runs out");
+    assert.match(got, /^STOP r1: the user cancelled "long job" on the call\.[^\n]*\n\nThen call call_next again\.$/);
+  } finally { b.stop(); }
+});
+
+test("call_confirm for a cancelled request is declined at once and shows no card; an open card closes", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: "clean up" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await page.post("cancel", { id: "r1" });
+    const out = await b.tool("call_confirm", { action: "rm -rf build", why: "Clean." });
+    assert.match(out, /^STOP r1: /, "the first call tool after the cancel carries the notice");
+    assert.match(out, /\n\nDECLINED: the user cancelled r1 on the call\. Do not do it\.$/);
+    await sleep(100);
+    assert.ok(!events.frames.some((f) => f.type === "confirm"), "no approval card for cancelled work");
+    await page.post("typed", { text: "deploy it" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r2
+    const asked = b.tool("call_confirm", { action: "vercel deploy --prod", why: "Deploy." });
+    const card = await events.waitFor((f) => f.type === "confirm");
+    await page.post("cancel", { id: "r2" });
+    assert.match(await asked, /DECLINED: the user cancelled r2 on the call\. Do not do it\./);
+    assert.equal((await events.waitFor((f) => f.type === "confirm_done" && f.id === card.id)).approved, false);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("notices carry their kind, and only a known one", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    const h = hookHeaders(b, page);
+    await post(page.base + "notify", { text: "Claude needs your permission to use Bash", kind: "permission" }, h);
+    await post(page.base + "notify", { text: "Claude stopped listening", kind: "stopped" }, h);
+    await post(page.base + "notify", { text: "plain", kind: "<b>" }, h);
+    assert.equal((await events.waitFor((f) => f.type === "notify" && /permission/.test(f.text))).kind, "permission");
+    assert.equal((await events.waitFor((f) => f.type === "notify" && /stopped/.test(f.text))).kind, "stopped");
+    assert.equal((await events.waitFor((f) => f.type === "notify" && f.text === "plain")).kind, undefined);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("there is no activity feed (F6 skipped): the hook token opens nothing new", async () => {
+  const { b, page } = await started();
+  try {
+    const h = hookHeaders(b, page);
+    assert.equal((await post(page.base + "activity", { tool: "Bash", summary: "npm test" }, h)).status, 403);
+    assert.equal((await page.post("activity", { tool: "Bash", summary: "npm test" })).status, 404);
+  } finally { b.stop(); }
+});
+
+test("the voice briefing covers the screen, files the user shares, and cancelling", async () => {
+  const oa = await mockOpenAI();
+  const { b, page } = await started({ TTC_OPENAI_BASE: oa.base, TTC_OPENAI_API_KEY: KEY });
+  try {
+    await page.post("live", { sdp: "v=0 offer" });
+    const brief = JSON.parse(oa.seen.find((s) => s.url === "/v1/live/sessions").body).session.instructions;
+    assert.match(brief, /Claude can put things on the user's screen/);
+    assert.match(brief, /never try to read that content out/i);
+    assert.match(brief, /share files and screenshots on the call page/);
+    assert.match(brief, /just say "Cancelled\."/);
+    assert.ok(brief.length < 16000 * 3);
+  } finally { b.stop(); oa.close(); }
 });

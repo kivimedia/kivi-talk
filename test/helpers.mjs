@@ -113,6 +113,48 @@ export async function post(url, body, headers = {}) {
   return { status: r.status, json: j, text };
 }
 
+/* A file shared on the call page, the way the page sends it: raw bytes, the name in a header. */
+export async function upload(page, name, body, { type, headers = {} } = {}) {
+  const h = { cookie: page.cookie, "content-type": "application/octet-stream", "x-ttc-name": encodeURIComponent(name), ...headers };
+  if (type) h["x-ttc-type"] = type;
+  const r = await fetch(page.base + "upload", { method: "POST", headers: h, body });
+  let json = null;
+  const text = await r.text();
+  try { json = JSON.parse(text); } catch {}
+  return { status: r.status, json, text };
+}
+
+/* An upload that sends `bytes` and then waits for the answer without finishing its body: the
+   bridge must answer a too-big upload on its own, not after reading all of it. `declared` sets a
+   content-length; without it the body is chunked, so only counting can catch it. */
+export function rawUpload(url, headers, { bytes, declared }) {
+  return new Promise((resolve) => {
+    const u = new URL(url);
+    const req = http.request({
+      host: u.hostname, port: u.port, path: u.pathname, method: "POST", agent: false,
+      headers: { ...headers, ...(declared ? { "content-length": declared } : {}) },
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { body += c; });
+      const done = () => { resolve({ status: res.statusCode, body }); req.destroy(); };
+      res.on("end", done);
+      res.on("error", done);
+    });
+    req.on("error", (e) => resolve({ status: 0, error: e.code }));
+    const chunk = Buffer.alloc(1 << 20, 97);
+    let sent = 0;
+    const pump = () => {
+      while (sent < bytes) {
+        const part = chunk.subarray(0, Math.min(chunk.length, bytes - sent));
+        sent += part.length;
+        if (!req.write(part)) return req.once("drain", pump);
+      }
+    };
+    pump();
+  });
+}
+
 /* Minimal SSE reader: collects parsed `data:` frames. */
 export function sse(url, headers = {}) {
   const frames = [];
@@ -136,7 +178,8 @@ export function sse(url, headers = {}) {
   return {
     frames,
     close() { ctrl.abort(); return done; },
-    async waitFor(pred, ms = 3000) {
+    // Generous by default: only a failing test waits this long, and a busy machine is slow.
+    async waitFor(pred, ms = 15000) {
       const t0 = Date.now();
       while (Date.now() - t0 < ms) {
         const f = frames.find(pred);

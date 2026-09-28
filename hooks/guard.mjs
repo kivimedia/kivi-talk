@@ -1,15 +1,20 @@
 #!/usr/bin/env node
-/* kivi-talk hooks, one script, four modes:
+/* kivi-talk hooks, one script, five modes:
  *
- *   allow   PreToolUse on this plugin's own call_* tools: approve them, so a call does not stop
- *           for a permission prompt every time Claude goes back to listening. Nothing else is
- *           approved here: every other tool keeps the session's own permission rules.
- *   bind    PostToolUse on call_start: remember which bridge belongs to this session. The MCP
- *           server cannot know the session id; the hook input carries it.
- *   stop    Stop: while this session's call is open and nothing is listening, send Claude back
- *           to call_next instead of letting the turn end and the voice go silent.
- *   notify  Notification (permission prompts): say it out loud on the call, because the user is
- *           talking, not watching the screen.
+ *   allow     PreToolUse on this plugin's own call_* tools: approve them, so a call does not stop
+ *             for a permission prompt every time Claude goes back to listening. Nothing else is
+ *             approved here: every other tool keeps the session's own permission rules.
+ *   classify  PostToolUse on call_next and call_say: tell auto mode where a request came from.
+ *   bind      PostToolUse on call_start: remember which bridge belongs to this session. The MCP
+ *             server cannot know the session id; the hook input carries it.
+ *   stop      Stop: while this session's call is open and nothing is listening, send Claude back
+ *             to call_next instead of letting the turn end and the voice go silent.
+ *   notify    Notification (permission prompts): say it out loud on the call, because the user is
+ *             talking, not watching the screen, and let the page show that it waits in Claude's
+ *             own window, where the call cannot answer it.
+ *
+ * There is deliberately no hook on every tool: PreToolUse cannot run in the background, so each
+ * one would hold up every tool call in every session by a Node start.
  *
  * Every mode fails OPEN: a hook that cannot reach the bridge lets Claude carry on normally.
  */
@@ -75,13 +80,15 @@ function bridgeFor(b) {
   } catch { return null; }
 }
 
-async function getJson(br, sub, ms = 2000) {
+/* A few seconds, not one or two: a busy machine can spend that long just starting fetch in a fresh
+   process, and a notice that never leaves is lost. Every mode still fails open after it. */
+async function getJson(br, sub, ms = 5000) {
   const r = await fetch(br.base + sub, { headers: { "x-ttc-hook": br.token }, signal: AbortSignal.timeout(ms) });
   if (!r.ok) throw new Error("HTTP " + r.status);
   return r.json();
 }
 
-async function postJson(br, sub, body, ms = 2000) {
+async function postJson(br, sub, body, ms = 5000) {
   await fetch(br.base + sub, {
     method: "POST",
     headers: { "content-type": "application/json", "x-ttc-hook": br.token },
@@ -135,8 +142,15 @@ async function main() {
       const asks = new Set();
       for (const m of whole.matchAll(/^\[[^\]\n]*\] User \(NOT HANDED OVER to you during the call\): (.*)$/gm)) asks.add(m[1]);
       const open = whole.match(/^Handed to you but not answered on the call: (.*)$/m);
-      // Something the user clicked Decline on is not an ask.
-      if (open) for (const m of open[1].matchAll(/r\d+ "([^"]*)"( \(the user clicked Decline)?/g)) if (!m[2]) asks.add(m[1]);
+      // Something the user clicked Decline on, or cancelled on the call, is not an ask. Each
+      // request's notes run up to the next request.
+      if (open) {
+        const reqs = [...open[1].matchAll(/r\d+ "([^"]*)"/g)];
+        reqs.forEach((m, i) => {
+          const notes = open[1].slice(m.index + m[0].length, i + 1 < reqs.length ? reqs[i + 1].index : undefined);
+          if (!/\(the user (?:clicked Decline|cancelled it)/.test(notes)) asks.add(m[1]);
+        });
+      }
       if (!asks.size) return;
       const list = [...asks].map((a) => `"${a.replace(/\s+/g, " ").slice(0, 300)}"`).join(" | ").slice(0, 1500);
       out({
@@ -185,7 +199,12 @@ async function main() {
   if (mode === "stop") {
     let st;
     try { st = await getJson(br, "/status"); }
-    catch { dropBinding(sid); return; }          // bridge gone: the call is over
+    catch (e) {
+      /* Gone (refused, or the port answers for another call): the call is over. Only slow (a busy
+         machine): let this stop through, but keep the binding, or every later stop would too. */
+      if (e.name !== "TimeoutError") dropBinding(sid);
+      return;
+    }
     if (st.state === "ended") { dropBinding(sid); return; }
     if (st.nextPending) return;                   // already listening (maybe in the background)
     /* A loop guard. If Claude has been sent back three times and has not touched the call
@@ -193,7 +212,7 @@ async function main() {
     if (st.lastLoopAt && st.lastLoopAt === b.lastLoopAt && b.blocks >= 3) {
       if (!b.gaveUp) {   // said once, not on every later stop
         writeBinding(sid, { ...b, gaveUp: true });
-        try { await postJson(br, "/notify", { text: "Claude stopped listening on the call. Type in its window, or say goodbye and call again." }); } catch {}
+        try { await postJson(br, "/notify", { text: "Claude stopped listening on the call. Type in its window, or say goodbye and call again.", kind: "stopped" }); } catch {}
       }
       return;
     }
@@ -211,7 +230,9 @@ async function main() {
   if (mode === "notify") {
     const msg = String(input.message || "").trim();
     if (!msg) return;
-    try { await postJson(br, "/notify", { text: msg + " (the approval is on screen in Claude's window)" }); } catch {}
+    // hooks.json only routes permission prompts here; an older host may not name the type.
+    const kind = !input.notification_type || input.notification_type === "permission_prompt" ? "permission" : undefined;
+    try { await postJson(br, "/notify", { text: msg + " (the approval is on screen in Claude's window)", kind }); } catch {}
   }
 }
 
