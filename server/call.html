@@ -87,10 +87,6 @@ button.small { padding: 6px 10px; font-size: 14px; }
 .req-top { display: flex; align-items: center; gap: 10px; }
 .req-label { flex: 1; min-width: 0; font-size: 14px; overflow-wrap: anywhere; }
 .req-top button { flex: none; }
-.req-now { margin: 4px 0 0; font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
-.req-steps { margin-top: 4px; font-size: 14px; color: var(--muted); }
-.req-steps summary { cursor: pointer; }
-.req-steps ol { margin: 4px 0 0; padding-inline-start: 22px; max-height: 30vh; overflow-y: auto; overflow-wrap: anywhere; }
 
 /* On screen: what Claude showed instead of reading it out. */
 .screen-head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
@@ -357,7 +353,6 @@ button.small { padding: 6px 10px; font-size: 14px; }
        "idleMinutes", "maxMinutes", "pricePerMinute"].forEach(function (k) { if (k in m) CFG[k] = m[k]; });
       claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
       if (Array.isArray(m.items)) setItems(m.items);
-      restoreActivity(m.activity);
       if (Array.isArray(m.pending)) onAttachments(m.pending);
       if (m.state === "ended") {
         endSeen = true;
@@ -396,13 +391,6 @@ button.small { padding: 6px 10px; font-size: 14px; }
         ? "took " + m.id + " out of the queue; Claude never started it"
           + (dropped && dropped.files ? ". The " + dropped.files + " file(s) with it were not sent; Claude gets them in the end-of-call hand-off" : "")
         : "stopping " + m.id + ": Claude is told at its next step", "note");
-      return;
-    }
-    if (m.type === "activity") {
-      /* The step that needs the approval posts its own line at about the same moment as the
-         notice, in either order: only a later step means Claude moved on. */
-      if (Date.now() - permShownAt > PERM_GRACE_MS) hidePerm();
-      onActivity(m);
       return;
     }
     if (m.type === "instruct") {
@@ -459,7 +447,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
     var shown = (typeof m.display === "string" && m.display) || (Array.isArray(m.files) && m.files.length) ? addScreen(m) : null;
     var li = addLine("Claude", m.text, m.final ? "claude" : "progress");
     if (shown) addShowButton(li, shown);
-    if (phase === "live") setStatus(m.final ? "Claude answered." : "Claude is still working.", m.text + (shown ? " (details on screen)" : ""));
+    // Claude's line usually says it is on screen already; say it only when it does not.
+    if (phase === "live") setStatus(m.final ? "Claude answered." : "Claude is still working.", m.text + (shown && !/on (?:your |the )?screen/i.test(m.text) ? " (details on screen)" : ""));
     /* The voice only learns THAT something is on screen, never what: display text and files stay
        on this computer. Said before the answer, so the voice can point the user at the page. */
     if (shown) thinking(lastOf(m.delegationIds), "Claude also put details on the user's screen, on the call page.");
@@ -1757,7 +1746,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
   /* Every request Claude has open, each with a Stop. The rows are rebuilt only when the list
      itself changes (the clocks tick in place), and a rebuilt Stop stays dead for a moment, so a
      click never lands on a row that just swapped in under the pointer. */
-  var items = [], itemSig = "", rows = {}, acts = {}, stepsOpen = {}, stopBusy = {}, stopArm = null;
+  var items = [], itemSig = "", rows = {}, stopBusy = {}, stopArm = null;
 
   function newestItem(state) {
     for (var k = items.length - 1; k >= 0; k--) if (items[k].state === state) return items[k];
@@ -1791,19 +1780,9 @@ button.small { padding: 6px 10px; font-size: 14px; }
         btn.disabled = true;
         btn.addEventListener("click", function () { stopRequest(it.id, btn); });
       }
-      var now = li.appendChild(el("p", "req-now"));
-      now.hidden = true;
-      var det = li.appendChild(el("details", "req-steps"));
-      det.hidden = true;
-      det.open = Boolean(stepsOpen[it.id]);
-      det.addEventListener("toggle", function () { stepsOpen[it.id] = det.open; });
-      var sum = det.appendChild(el("summary"));
-      var ol = det.appendChild(el("ol"));
-      rows[it.id] = { it: it, head: head, btn: btn, now: now, det: det, sum: sum, ol: ol };
-      paintActivity(it.id);
+      rows[it.id] = { it: it, head: head, btn: btn };
     });
     box.hidden = !items.length;
-    for (var k in acts) if (!rows[k]) delete acts[k];
     clearTimeout(stopArm);
     stopArm = setTimeout(function () {
       for (var id in rows) if (rows[id].btn && !stopBusy[id]) rows[id].btn.disabled = false;
@@ -1850,64 +1829,15 @@ button.small { padding: 6px 10px; font-size: 14px; }
     }
   }
 
-  /* What Claude is doing right now (one line per tool it runs), under the request it belongs
-     to. Shown here only: never sent to OpenAI. Hidden until the first step arrives, so a bridge
-     without the activity hook shows nothing rather than an empty box. */
-  function onActivity(m) {
-    var w = newestItem("working") || newestItem("stopping");
-    var id = m.id || (w && w.id);
-    if (id && addStep(id, m)) paintActivity(id);
-  }
-
-  /* A reloaded or reconnected page gets the steps so far with its hello, and a reconnect then
-     replays the frames it missed, so a step can arrive twice: it is kept once. */
-  function addStep(id, m) {
-    var list = acts[id] || (acts[id] = []);
-    var a = { tool: String(m.tool || ""), summary: String(m.summary || ""), at: Number(m.at) || Date.now() };
-    for (var k = 0; k < list.length; k++) {
-      if (list[k].at === a.at && list[k].tool === a.tool && list[k].summary === a.summary) return false;
-    }
-    list.push(a);
-    if (list.length > 1 && list[list.length - 2].at > a.at) list.sort(function (x, y) { return x.at - y.at; });
-    if (list.length > 30) list.shift();
-    return true;
-  }
-
-  // Only for requests still open: steps of finished work are history, not "now".
-  function restoreActivity(list) {
-    if (!Array.isArray(list)) return;
-    var touched = {};
-    list.forEach(function (a) { if (a && a.id && rows[a.id] && addStep(a.id, a)) touched[a.id] = true; });
-    for (var id in touched) paintActivity(id);
-  }
-
-  function stepText(a) {
-    return a.summary && a.tool && a.summary !== a.tool && a.tool.indexOf("mcp__") !== 0 ? a.tool + " · " + a.summary : (a.summary || a.tool);
-  }
-
-  function paintActivity(id) {
-    var r = rows[id], list = acts[id];
-    if (!r || !list || !list.length) return;
-    r.now.hidden = false;
-    r.now.textContent = "Now: " + stepText(list[list.length - 1]);
-    r.det.hidden = false;
-    r.sum.textContent = "Steps so far (" + list.length + ")";
-    r.ol.textContent = "";
-    list.forEach(function (a) {
-      r.ol.appendChild(el("li", "", clockTime(a.at, true) + " · " + stepText(a))).setAttribute("dir", "auto");
-    });
-  }
-
   /* ------------------------------------------------ permission banner -- */
 
   /* Claude Code's own permission prompt stalls the work, and a plugin cannot answer it. The call
-     can only say so, loudly, until Claude moves again (its next say, step or notice). */
-  var permTimer = null, permShownAt = 0, PERM_GRACE_MS = 3000;
+     can only say so, loudly, until Claude moves again (its next say or notice). */
+  var permTimer = null;
 
   function showPerm(t) {
     $("permText").textContent = t;
     $("permBox").hidden = false;
-    permShownAt = Date.now();
     clearTimeout(permTimer);
     permTimer = setTimeout(hidePerm, 10 * 60000);
     $("permBox").scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -2035,7 +1965,6 @@ button.small { padding: 6px 10px; font-size: 14px; }
 
   render();
   if (Array.isArray(CFG.items)) setItems(CFG.items);
-  restoreActivity(CFG.activity);
   connectEvents();
   if (CFG.state === "ended") {
     phase = "ended";

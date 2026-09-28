@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /* Deterministic page-side simulation of the 0.5.0 "nothing said is lost" behaviour (1-7) and the
  * 0.6.0 rich parity features (8-17): what Claude shows on screen, files both ways, Stop and
- * spoken cancel, the permission banner, the live activity line, the phone layout and the files
- * that never went with a request.
+ * spoken cancel, the permission banner, the phone layout and the files that never went with a
+ * request.
  *
  * The REAL bridge (server/bridge.mjs over stdio) and the REAL call page (server/call.html) in
  * headless Chrome. Only the two things that would cost money or need hardware are faked:
@@ -11,7 +11,7 @@
  *     RTCPeerConnection is a stub whose data channel records what the page sends (window.__sent)
  *     and lets this harness play gpt-live-1's events into the page (window.__dc.onmessage).
  * Claude's side is driven with the MCP tools (call_next / call_say / call_instruct). The hooks'
- * side (/notify, /activity) is driven with the hook token, the way hooks/guard.mjs does it.
+ * side (/notify) is driven with the hook token, the way hooks/guard.mjs does it.
  *
  * No OpenAI call, no Claude session, no cost. About 5 minutes. Screenshots of the new cards go
  * to test/e2e/out/ (gitignored).
@@ -203,13 +203,10 @@ function sharedPaths(reqText, heading = "Files the user shared with this request
 const chipTexts = (page) => page.evaluate(() => [...document.querySelectorAll("#chips .chip-text")].map((c) => c.textContent));
 const readyChips = async (page) => (await chipTexts(page)).filter((t) => !t.startsWith("uploading "));
 const reqRows = (page) => page.evaluate(() => [...document.querySelectorAll("#reqs > li")].map((li) => {
-  const btn = li.querySelector(".req-top button"), now = li.querySelector(".req-now"), det = li.querySelector(".req-steps");
+  const btn = li.querySelector(".req-top button");
   return {
     label: li.querySelector(".req-label").textContent,
     btn: btn ? { label: btn.getAttribute("aria-label"), disabled: btn.disabled, text: btn.textContent } : null,
-    now: now && !now.hidden ? now.textContent : null,
-    steps: det && !det.hidden ? det.querySelector("summary").textContent : null,
-    stepItems: det ? det.querySelectorAll("li").length : 0,
   };
 }));
 const screenPos = (page) => page.evaluate(() => {
@@ -845,7 +842,6 @@ def(13, "Stop buttons: a queued request is taken out, the working one is stopped
   check(/^r1 · working \d+:\d\d · Run the full test suite\.$/.test(fresh[0].label), "row r1 reads 'r1 · working m:ss · <text>'", fresh[0].label);
   check(/^r2 · queued · Also update the changelog\.$/.test(fresh[1].label), "row r2 reads 'r2 · queued · <text>'", fresh[1].label);
   check(fresh[0].btn && fresh[0].btn.label === "Stop request r1" && fresh[1].btn.label === "Stop request r2", "each row has a Stop labelled for its request");
-  check(fresh[0].now === null && fresh[0].steps === null, "no activity line or Steps so far before any activity");
   await sleep(800);
   check((await reqRows(page)).every((r) => r.btn && !r.btn.disabled), "the Stop buttons arm after 700 ms");
   info("screenshots: " + await shots(page, "requests", "#statusBox"));
@@ -914,7 +910,7 @@ def(14, "spoken cancel: 'Stop.' stops the work at once, and the voice's own hand
   check(requests(b).length === 1, "still exactly one request", JSON.stringify(requests(b)));
 });
 
-def(15, "permission banner from the Notification hook, then the live activity line", async ({ b, page, check, ctx, info }) => {
+def(15, "permission banner from the Notification hook, hidden when Claude moves again", async ({ b, page, check, info }) => {
   const r1 = await delegate(b, page, "Delete the build folder.", "del_s15");
   check(/^REQUEST r1 /.test(r1.text), "r1 is in flight", firstLine(r1.text));
   await until(async () => (await reqRows(page)).length === 1, 4000, "r1 in the Requests list");
@@ -932,44 +928,14 @@ def(15, "permission banner from the Notification hook, then the live activity li
   const st = await status(page);
   check(/^Claude is waiting for your approval in its own window\./.test(st), "the status line says the same", st);
 
-  /* The async PreToolUse hook of the very step that needs the approval posts its line at about the
-     same moment as the notice: that one must not take the banner down. */
-  const a = await hookPost(b, "/activity", { tool: "Bash", summary: "rm -rf build ZEBRA15" });
-  if (a.status === 404) {
-    info("activity skipped: this bridge has no POST /activity (F6 not built)");
-    info("screenshots: " + await shots(page, "banner", "#permBox"));
-    await b.tool("call_say", { id: "r1", text: "Waiting for your approval in the Claude window.", final: false });
-  } else {
-    check(a.status === 200, "POST /activity with the hook token", `${a.status} ${JSON.stringify(a.json)}`);
-    const row = await until(async () => { const rows = await reqRows(page); return rows[0] && rows[0].now && rows[0]; }, 4000, "the Now: line");
-    check(row.now === "Now: Bash · rm -rf build ZEBRA15" && row.steps === "Steps so far (1)", "the working request shows 'Now: ...' and Steps so far", `${row.now} / ${row.steps}`);
-    const age = Date.now() - shownAt;
-    if (age < 2500) check(!(await page.evaluate(() => document.getElementById("permBox").hidden)), "the step that lands with the notice leaves the banner up", `${age}ms after it`);
-    else info(`banner race check skipped: the step landed ${age}ms after the banner (grace is 3000ms)`);
-    info("screenshots: " + await shots(page, "banner", "#permBox"));
-    info("screenshots: " + await shots(page, "activity", "#statusBox"));
-    await sleep(Math.max(0, shownAt + 3300 - Date.now()));
-    await hookPost(b, "/activity", { tool: "Read", summary: "package.json" });
-    const row2 = await until(async () => { const rows = await reqRows(page); return rows[0] && rows[0].steps === "Steps so far (2)" && rows[0]; }, 4000, "the second step");
-    check(row2.now === "Now: Read · package.json" && row2.stepItems === 2, "the Now line follows the newest step; the list keeps both", `${row2.now} (${row2.stepItems} steps)`);
-    const leaked = await leaks(page, ["rm -rf", "ZEBRA15", "package.json"]);
-    check(leaked.length === 0, "no activity reached the voice", leaked.join(" | ") || "none");
-
-    // A reopened page (a second tab here; a reload ends a live call) gets the steps so far, each once.
-    const tab = await ctx.newPage();
-    const tabErrors = [];
-    tab.on("pageerror", (e) => tabErrors.push(e.message));
-    await tab.goto(page.url(), { waitUntil: "domcontentloaded" });
-    const again = await until(async () => { const rows = await reqRows(tab); return rows[0] && rows[0].steps && rows[0]; }, 5000, "the reopened page's Steps so far");
-    await sleep(500);   // its hello lands too, carrying the same steps
-    const settled = (await reqRows(tab))[0];
-    check(again.now === "Now: Read · package.json" && settled.steps === "Steps so far (2)" && settled.stepItems === 2,
-      "a reopened page shows the steps so far, each once", `${again.now} / ${settled.steps} / ${settled.stepItems} item(s)`);
-    check(tabErrors.length === 0, "no errors in the reopened page", tabErrors.join(" | ") || "none");
-    await tab.close();
-  }
+  info("screenshots: " + await shots(page, "banner", "#permBox"));
+  // The hook token opens status and notices only (0.6.0 has no activity endpoint).
+  const a = await hookPost(b, "/activity", { tool: "Bash", summary: "rm -rf build" });
+  check(a.status === 403, "the hook token cannot post anything else", `${a.status} ${JSON.stringify(a.json)}`);
+  check(!(await page.evaluate(() => document.getElementById("permBox").hidden)), "the banner stays up until Claude moves");
+  await b.tool("call_say", { id: "r1", text: "Waiting for your approval in the Claude window.", final: false });
   const hidden = await until(() => page.evaluate(() => document.getElementById("permBox").hidden), 4000, "the banner to hide once Claude moves again");
-  check(hidden, "the banner hides on the next activity or say");
+  check(hidden, "the banner hides on Claude's next say", `${Date.now() - shownAt}ms after it appeared`);
   check(JSON.parse(await b.tool("call_status")).state === "live", "the call is still live");
 });
 
