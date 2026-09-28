@@ -881,11 +881,14 @@ function transcriptText(b) {
   return fs.existsSync(dir) ? fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf8")).join("") : "";
 }
 
-test("0.6.0: version, and call_say takes display and files in its schema", async () => {
+test("0.6: the server reports the plugin's version, and call_say takes display and files in its schema", async () => {
   const b = startBridge();
   try {
     const init = await b.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
-    assert.equal(init.result.serverInfo.version, "0.6.0");
+    // The version in plugin.json is what an installed copy updates on; the server must say the same.
+    const plugin = JSON.parse(fs.readFileSync(path.join(ROOT, ".claude-plugin", "plugin.json"), "utf8"));
+    assert.equal(init.result.serverInfo.version, plugin.version);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version, plugin.version);
     const say = (await b.rpc("tools/list", {})).result.tools.find((t) => t.name === "call_say");
     assert.equal(say.inputSchema.properties.display.type, "string");
     assert.equal(say.inputSchema.properties.files.type, "array");

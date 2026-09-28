@@ -1116,7 +1116,10 @@ button.small { padding: 6px 10px; font-size: 14px; }
       var e = all[k];
       if (!e.mdDir) continue;
       var d = e.mdDir === "auto" ? "auto" : firstDir(e);
-      if (d) e.setAttribute("dir", d);   // no letters at all: it keeps the direction around it
+      if (!d) continue;   // no letters at all: it keeps the direction around it
+      e.setAttribute("dir", d);
+      // A table sits where its box starts: a Hebrew table hugs the right, not just reads from it.
+      if (e.tagName === "TABLE" && e.parentNode.classList.contains("tablewrap")) e.parentNode.setAttribute("dir", d);
     }
   }
 

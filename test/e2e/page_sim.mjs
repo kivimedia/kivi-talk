@@ -1175,11 +1175,14 @@ def(18, "Hebrew: lists, quotes and tables read right to left, and a Hebrew file 
       quote: d(q), bar: { left: qs.borderLeftWidth, right: qs.borderRightWidth },
       table: d(md.querySelector("table")),
       th: [...md.querySelectorAll("th")].map((x) => ({ t: x.textContent, x: Math.round(x.getBoundingClientRect().left) })),
+      // Where the table sits in its box: a Hebrew table hugs the right edge.
+      hug: (() => { const t = md.querySelector("table").getBoundingClientRect(), w = md.querySelector(".tablewrap").getBoundingClientRect(); return { gapRight: Math.round(w.right - t.right), gapLeft: Math.round(t.left - w.left) }; })(),
     };
   });
   check(v.lists.join() === "rtl,rtl,ltr" && v.items.join() === "rtl,rtl,rtl,ltr,ltr", "Hebrew lists read right to left (bullets on the right), the English one left to right", `${v.lists.join()} / ${v.items.join()}`);
   check(v.quote === "rtl" && v.bar.right !== "0px" && v.bar.left === "0px", "a Hebrew quote reads right to left, with its bar on the right", JSON.stringify({ quote: v.quote, bar: v.bar }));
   check(v.table === "rtl" && v.th.length === 2 && v.th[0].x > v.th[1].x, "a Hebrew table puts its first column on the right", JSON.stringify(v.th));
+  check(v.hug.gapRight <= 1 && v.hug.gapLeft > 20, "a Hebrew table sits against the right edge of the card, not the left", JSON.stringify(v.hug));
 
   const imgSize = fs.statSync(IMG).size + " B";
   const cap = await textBoxes(page, "#screenBody figure figcaption", ["צילום מסך", imgSize]);

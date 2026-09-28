@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.6.0";
+export const VERSION = "0.6.1";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
