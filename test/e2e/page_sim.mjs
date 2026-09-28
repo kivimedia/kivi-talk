@@ -611,8 +611,11 @@ def(8, "On screen: markdown rendered safely (XSS payloads stay text), table, cod
       quote: Boolean(md.querySelector("blockquote strong")),
       inlines: ["strong", "em", "del", "code"].filter((tag) => md.querySelector("p " + tag)),
       heb: heb ? { dir: heb.getAttribute("dir"), rtl } : null,
-      noDir: [...md.querySelectorAll("p, h3, h4, h5, h6, ul, ol, li, blockquote, table, th, td")].filter((e) => e.getAttribute("dir") !== "auto").map((e) => e.tagName),
+      // Text blocks read their own direction; lists, quotes and tables take their first words' (all English here).
+      noDir: [...md.querySelectorAll("p, h3, h4, h5, h6, th, td")].filter((e) => e.getAttribute("dir") !== "auto").map((e) => e.tagName)
+        .concat([...md.querySelectorAll("ul, ol, li, blockquote, table")].filter((e) => e.getAttribute("dir") !== "ltr").map((e) => e.tagName + "=" + e.getAttribute("dir"))),
       meta: document.getElementById("screenMeta").textContent,
+      copyStatus: (() => { const s = md.querySelector(".code .code-bar [role=status]"); return s ? s.className : null; })(),
     };
   });
   check(v.xss === undefined && v.scripts === 0 && v.imgs === 0, "no script ran and no element was made from raw HTML", `__xss=${v.xss} scripts=${v.scripts} imgs=${v.imgs}`);
@@ -630,7 +633,7 @@ def(8, "On screen: markdown rendered safely (XSS payloads stay text), table, cod
   check(v.diff.add === 1 && v.diff.del === 1, "a diff block colours its + and - lines", JSON.stringify(v.diff));
   check(v.nested === 2 && v.quote, "nested list by indentation, and a blockquote with bold inside", `nested=${v.nested} quote=${v.quote}`);
   check(v.heb && v.heb.dir === "auto" && v.heb.rtl !== false, "the Hebrew paragraph has dir=auto and reads right to left", JSON.stringify(v.heb));
-  check(v.noDir.length === 0, "every block has dir=auto", v.noDir.join(",") || "all");
+  check(v.noDir.length === 0, "every text block has dir=auto, and every English list, quote and table is ltr", v.noDir.join(",") || "all");
   check(v.meta.startsWith("answer to r1 · "), "meta line says whose answer it is", v.meta);
 
   await page.bringToFront();
@@ -640,11 +643,15 @@ def(8, "On screen: markdown rendered safely (XSS payloads stay text), table, cod
     return t !== "Copy" && t;
   }, 3000, "the code Copy button to answer");
   check(copied === "Copied", "the code block's Copy says Copied", copied);
+  const announced = await page.$eval("#screenBody .code .code-bar [role=status]", (el) => el.textContent).catch(() => null);
+  check(v.copyStatus === "sr-only" && announced === "Copied to the clipboard.", "a screen reader hears the code Copy result too (a status line of its own)", `${v.copyStatus} "${announced}"`);
   try { info("clipboard after code Copy: " + JSON.stringify(await page.evaluate(() => navigator.clipboard.readText()))); } catch (e) { info("clipboard read-back unavailable: " + e.message); }
 
   const lines = await logLines(page);
   const answer = lines.find((l) => l.cls === "claude" && l.text.startsWith("I put the script"));
   check(answer && answer.show, "the log line of that answer has a Show on screen button");
+  const showName = await page.$eval("#log button.show", (el) => el.getAttribute("aria-label") || el.textContent);
+  check(showName.startsWith("Show on screen"), "its spoken name starts with the words on it (voice control finds it)", showName);
   const notes = (await thinkings(page)).filter((m) => m.content === DISPLAY_NOTE);
   check(notes.length === 1, "the voice got exactly one note that details are on screen", `${notes.length} note(s)`);
   const leaked = await leaks(page, ["ZEBRA7731", "example.com", "Deploy notes", "not bold"]);
@@ -665,32 +672,51 @@ def(8, "On screen: markdown rendered safely (XSS payloads stay text), table, cod
   check((await thinkings(page)).filter((m) => m.content === DISPLAY_NOTE).length === 2, "one display note per say (two says, two notes)");
   info("screenshots: " + await shots(page, "onscreen", "#screenBox"));
 
-  // Pathological input: every forward search is bounded, so this renders at once.
-  const nasty = "[".repeat(20000) + " " + "*a ".repeat(10000) + "`x ".repeat(10000) + "_".repeat(5000);
-  const t0 = Date.now();
-  await b.tool("call_say", { text: "Another note is on your screen.", display: nasty });
-  await until(async () => (await screenPos(page)) === "3 of 3", 8000, "the pathological entry to render");
-  const took = Date.now() - t0;
-  check(took < 4000, "a 75,000-character pathological display renders in under 4 seconds", `${took}ms`);
+  /* Pathological input: every scan is bounded or linear, so each of these renders at once. Before
+     the 0.6.0 review each one was quadratic: at 40,000 characters the URL took 13 s, the digits 6 s. */
+  const nasty = {
+    "brackets, emphasis and backticks": "[".repeat(20000) + " " + "*a ".repeat(10000) + "`x ".repeat(10000) + "_".repeat(5000),
+    "a URL followed by 99,000 ')'": "see https://x.io/" + ")".repeat(99000),
+    "a heading with 99,000 spaces": "# a" + " ".repeat(99000) + "b",
+    "a table delimiter with 99,000 spaces": "a | b\n" + " ".repeat(99000) + "x-",
+    "25,000 digit-only code spans": "`1` ".repeat(25000),
+    "a 4,500-row numeric table": "| a | b |\n| --- | --- |\n" + Array.from({ length: 4500 }, (_, k) => `| ${k} | ${k * 7} |`).join("\n"),
+  };
+  let at = 2;
+  for (const [what, display] of Object.entries(nasty)) {
+    at++;
+    const t0 = Date.now();
+    await b.tool("call_say", { text: "Another note is on your screen.", display });
+    await until(async () => (await screenPos(page)) === `${at} of ${at}`, 60000, `the entry with ${what} to render`);
+    const took = Date.now() - t0;
+    check(took < 4000, `${what} (${display.length.toLocaleString("en-US")} characters) renders in under 4 seconds`, `${took}ms`);
+  }
 });
 
 def(9, "files from Claude: an image thumbnail loads, a text file opens in a new tab", async ({ b, page, check, ctx, info }) => {
   const dir = scratch(b, "claude-files");
-  const PNG = path.join(dir, "chart.png"), TXT = path.join(dir, "notes.txt");
+  const PNG = path.join(dir, "chart.png"), TXT = path.join(dir, "notes.txt"), ZIP = path.join(dir, "build.zip");
   fs.writeFileSync(PNG, png(64, 40, [30, 120, 200]));
   fs.writeFileSync(TXT, "hello from a shared file ZEBRA9\n");
+  fs.writeFileSync(ZIP, "PK zip ZEBRA9\n");
   const said = await b.tool("call_say", {
     text: "The chart and my notes are on your screen.",
     display: "The chart:\n\n![weekly chart](chart.png)\n\nMy notes are in [the notes file](notes.txt).",
-    files: [PNG, TXT],
+    files: [PNG, TXT, ZIP],
   });
-  check(/2 file/.test(said), "the call_say result counts the files shown", firstLine(said));
+  check(/3 file/.test(said), "the call_say result counts the files shown", firstLine(said));
   await until(async () => (await screenPos(page)) === "1 of 1", 5000, "the On screen card");
   const img = await until(() => page.evaluate(() => {
     const t = document.querySelector("#screenBody .files figure img");
-    return t && t.complete && t.naturalWidth > 0 ? { w: t.naturalWidth, h: t.naturalHeight, src: t.getAttribute("src") } : null;
+    return t && t.complete && t.naturalWidth > 0 ? { w: t.naturalWidth, h: t.naturalHeight, src: t.getAttribute("src"), shownW: t.getBoundingClientRect().width } : null;
   }), 5000, "the thumbnail to load");
   check(img.w === 64 && img.h === 40 && /\/file\/[A-Za-z0-9_%-]+$/.test(img.src), "the image thumbnail actually loaded from /file/<token>", JSON.stringify(img));
+  check(img.shownW <= img.w + 2, "a small picture is shown at its own size, never blown up to the card's width", `${img.w}px picture shown ${Math.round(img.shownW)}px wide (border included)`);
+  const dl = await page.evaluate(() => {
+    const a = [...document.querySelectorAll("#screenBody .file-row a")].find((x) => /build\.zip/.test(x.getAttribute("aria-label") || ""));
+    return a ? { text: a.textContent, label: a.getAttribute("aria-label"), download: a.getAttribute("download"), target: a.getAttribute("target") } : null;
+  });
+  check(dl && dl.text === "Download" && dl.download === "build.zip" && !dl.target, "a file the browser can only save says Download, not Open", JSON.stringify(dl));
   const inMd = await page.evaluate(() => { const t = document.querySelector("#screenBody .md img"); return t ? { w: t.naturalWidth, alt: t.alt } : null; });
   check(inMd && inMd.w === 64 && inMd.alt === "weekly chart", "![weekly chart](chart.png) in the markdown shows the shared picture", JSON.stringify(inMd));
   const row = await page.evaluate(() => {
@@ -710,11 +736,11 @@ def(9, "files from Claude: an image thumbnail loads, a text file opens in a new 
     const p2 = await target.page();
     info("the new tab shows: " + JSON.stringify(await Promise.race([p2.evaluate(() => document.body && document.body.innerText), sleep(3000).then(() => "(timed out)")])));
   } catch (e) { info("could not read the new tab (sandboxed): " + e.message); }
-  const leaked = await leaks(page, ["chart.png", "notes.txt", "weekly chart", "ZEBRA9"]);
+  const leaked = await leaks(page, ["chart.png", "notes.txt", "build.zip", "weekly chart", "ZEBRA9"]);
   check(leaked.length === 0, "no file name or content reached the voice", leaked.join(" | ") || "none");
 });
 
-def(10, "attach with the file input: progress chip, remove one, Send with only files", async ({ b, page, check, info }) => {
+def(10, "attach with the file input: progress chip, remove one, Send with only files", async ({ b, page, check, ctx, info }) => {
   const dir = scratch(b, "to-share");
   const A = path.join(dir, "alpha notes.txt"), B = path.join(dir, "beta.txt"), BIG = path.join(dir, "big.bin");
   fs.writeFileSync(A, "alpha ZEBRA10 upload\n");
@@ -739,15 +765,32 @@ def(10, "attach with the file input: progress chip, remove one, Send with only f
   const ready = await page.$eval("#attachNote", (el) => el.textContent);
   check(/^2 file\(s\) ready\. They go to Claude with your next request/.test(ready), "the page says the files wait for the next request", ready);
 
+  // A second tab of the same call (a duplicated tab) sees the same waiting files.
+  const tabB = await ctx.newPage();
+  await tabB.goto(page.url(), { waitUntil: "domcontentloaded" });
+  await until(async () => (await readyChips(tabB)).length === 2, 8000, "the second tab's chips");
+  await page.bringToFront();   // a click in a background tab never lands (puppeteer waits for it to paint)
   await page.click('button[aria-label="Remove beta.txt"]');
   await until(async () => !(await chipTexts(page)).some((c) => c.startsWith("beta.txt")), 4000, "the beta.txt chip to go");
-  check((await logLines(page)).some((l) => /^removed beta\.txt/.test(l.text)), "the log says beta.txt was removed");
+  // The line comes once the bridge has answered the remove.
+  const removedLine = await until(async () => (await logLines(page)).find((l) => /^removed beta\.txt/.test(l.text)), 4000, "the removed line").catch(() => null);
+  check(Boolean(removedLine), "the log says beta.txt was removed", removedLine && removedLine.text);
+  await until(async () => (await readyChips(tabB)).length === 1, 4000, "the chip to go in the second tab too");
+  await sleep(700);
+  const linesB = (await logLines(tabB)).filter((l) => /beta\.txt/.test(l.text));
+  check(linesB.length === 1 && linesB[0].who === "Call" && /^removed beta\.txt in another tab/.test(linesB[0].text),
+    "the other tab says beta.txt was removed there, never 'You shared: beta.txt'", linesB.map((l) => l.who + ": " + l.text).join(" | ") || "nothing");
+  await Promise.race([tabB.close(), sleep(3000)]);
 
+  // Keyboard focus on a Remove stays there while another upload redraws the chips.
+  await page.focus('button[aria-label="Remove alpha notes.txt"]');
   // Throttled, so the chip has time to show its progress.
   await page.emulateNetworkConditions({ download: -1, upload: 700 * 1024, latency: 0 });
   await input.uploadFile(BIG);
   await until(async () => (await readyChips(page)).some((c) => c.startsWith("big.bin · ")), 20000, "big.bin to finish uploading");
   await page.emulateNetworkConditions(null);
+  const focused = await page.evaluate(() => document.activeElement.getAttribute("aria-label") || document.activeElement.tagName);
+  check(focused === "Remove alpha notes.txt", "focus stayed on the Remove it was on while the chips were redrawn", focused);
   const seen = [...new Set(await page.evaluate(() => window.__chipTexts))];
   const progress = seen.filter((t) => /^uploading big\.bin \d+%$/.test(t));
   check(progress.length > 0, "the chip showed 'uploading big.bin N%' while it uploaded", progress.slice(0, 8).join(", "));
@@ -772,6 +815,22 @@ def(10, "attach with the file input: progress chip, remove one, Send with only f
 
 def(11, "paste a screenshot: it becomes pasted-image-HHMMSS.png and rides with the typed request", async ({ b, page, check }) => {
   const bytes = png(48, 32, [220, 40, 40]);
+  // Excel (and Word, OneNote) put a picture of the copied cells next to their text: that paste is text.
+  const office = await page.evaluate((arr) => {
+    const dt = new DataTransfer();
+    dt.setData("text/plain", "A1\tB1\n1\t2");
+    dt.setData("text/html", "<table><tr><td>A1</td><td>B1</td></tr></table>");
+    dt.items.add(new File([new Uint8Array(arr)], "image.png", { type: "image/png" }));
+    const ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+    if (!ev.clipboardData) Object.defineProperty(ev, "clipboardData", { value: dt });
+    const box = document.getElementById("typed");
+    box.focus();
+    box.dispatchEvent(ev);
+    return { prevented: ev.defaultPrevented, types: [...dt.types] };
+  }, [...bytes]);
+  await sleep(1500);
+  const chipsNow = await chipTexts(page);
+  check(!office.prevented && chipsNow.length === 0, "pasting cells copied from Excel into the box pastes their text, not a picture", `${JSON.stringify(office)} chips=${JSON.stringify(chipsNow)}`);
   const r0 = await page.evaluate((arr) => {
     const dt = new DataTransfer();
     dt.items.add(new File([new Uint8Array(arr)], "image.png", { type: "image/png" }));
@@ -845,6 +904,24 @@ def(13, "Stop buttons: a queued request is taken out, the working one is stopped
   await sleep(800);
   check((await reqRows(page)).every((r) => r.btn && !r.btn.disabled), "the Stop buttons arm after 700 ms");
   info("screenshots: " + await shots(page, "requests", "#statusBox"));
+
+  // A keyboard user on Stop r1 keeps their place when a new request redraws the list.
+  await page.focus('button[aria-label="Stop request r1"]');
+  const r3sent = await page.evaluate(async () => (await fetch(location.pathname.replace(/\/+$/, "") + "/typed", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "And bump the version." }),
+  })).status);
+  await until(async () => (await reqRows(page)).length === 3, 5000, "r3 in the Requests list");
+  await sleep(900);
+  const onStop = await page.evaluate(() => document.activeElement.getAttribute("aria-label") || document.activeElement.tagName);
+  check(r3sent === 200 && onStop === "Stop request r1", "focus is back on Stop r1 after the list was redrawn (not thrown to the page)", onStop);
+
+  // A spoken "stop" takes the newest QUEUED request first: r1 keeps working.
+  await userSays(page, "Stop.");
+  await until(async () => (await reqRows(page)).length === 2, 5000, "r3 to leave the list");
+  const afterSpoken = await reqRows(page);
+  const stoppedNote = (await logLines(page)).some((l) => l.cls === "note" && l.text === "you said stop, so the page is stopping r3");
+  check(afterSpoken.length === 2 && /^r1 · working /.test(afterSpoken[0].label) && /^r2 · queued /.test(afterSpoken[1].label) && stoppedNote,
+    "a spoken 'Stop.' took out the newest queued request (r3), not the one Claude is working on", afterSpoken.map((r) => r.label).join(" | "));
   await sleep(800);
 
   await page.click('button[aria-label="Stop request r2"]');
@@ -937,6 +1014,14 @@ def(15, "permission banner from the Notification hook, hidden when Claude moves 
   const hidden = await until(() => page.evaluate(() => document.getElementById("permBox").hidden), 4000, "the banner to hide once Claude moves again");
   check(hidden, "the banner hides on Claude's next say", `${Date.now() - shownAt}ms after it appeared`);
   check(JSON.parse(await b.tool("call_status")).state === "live", "the call is still live");
+
+  // Claude moves on without saying anything (an instruction to the voice): the status line moves on too.
+  await hookPost(b, "/notify", { text: NOTICE, kind: "permission" });
+  await until(() => page.evaluate(() => !document.getElementById("permBox").hidden), 4000, "the banner again");
+  await b.tool("call_instruct", { text: "Keep your answers short.", mode: "normal" });
+  await until(() => page.evaluate(() => document.getElementById("permBox").hidden), 4000, "the banner to hide on the instruction");
+  const moved = await status(page);
+  check(!moved.startsWith("Claude is waiting for your approval"), "after an instruction the status line no longer says Claude waits for approval", moved);
 });
 
 def(16, "phone width: nothing scrolls the page sideways at 390 and 360, and nothing interactive overlaps", async ({ b, page, check, info }) => {
@@ -975,6 +1060,13 @@ def(16, "phone width: nothing scrolls the page sideways at 390 and 360, and noth
     check(m.pre && m.table, `at ${w} px the long code line and the wide table scroll inside their own boxes`, JSON.stringify(m));
     const o = await overlaps(page);
     check(o.length === 0, `at ${w} px no two interactive elements overlap`, o.join(" | ") || "none");
+    const ph = await page.evaluate(() => {
+      const i = document.getElementById("typed"), cs = getComputedStyle(i);
+      const g = document.createElement("canvas").getContext("2d");
+      g.font = cs.font;
+      return { hint: i.placeholder, needs: Math.ceil(g.measureText(i.placeholder).width), room: Math.floor(i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)) };
+    });
+    check(ph.needs <= ph.room, `at ${w} px the typed box shows its whole hint, not cut mid-word`, JSON.stringify(ph));
   }
   await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
   await sleep(300);
@@ -1026,6 +1118,123 @@ def(17, "files that never went with a request: a stopped queued request, then th
     && never.some((p) => p.endsWith("queued-notes.txt")) && never.some((p) => p.endsWith("left-behind.txt")),
   "the hand-off lists both files as never sent, as absolute paths that exist", never.join(" | "));
   check((await leaks(page, ["queued-notes", "left-behind", "ZEBRA17"])).length === 0, "no file name or content reached the voice");
+});
+
+/* Where a piece of text is drawn: the box of the first place `needle` occurs in root's text. */
+function textBoxes(page, sel, needles) {
+  return page.evaluate((sel, needles) => {
+    const root = document.querySelector(sel);
+    if (!root) return null;
+    const box = (needle) => {
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n = w.nextNode(); n; n = w.nextNode()) {
+        const i = n.data.indexOf(needle);
+        if (i < 0) continue;
+        const r = document.createRange();
+        r.setStart(n, i);
+        r.setEnd(n, i + needle.length);
+        const b = r.getBoundingClientRect();
+        return { left: Math.round(b.left), right: Math.round(b.right) };
+      }
+      return null;
+    };
+    return { text: root.textContent, name: box(needles[0]), size: box(needles[1]) };
+  }, sel, needles);
+}
+
+def(18, "Hebrew: lists, quotes and tables read right to left, and a Hebrew file name keeps its size after it", async ({ b, page, check, info }) => {
+  const HEB = [
+    "- פריט ראשון",
+    "- פריט שני",
+    "",
+    "1. שלב אחד",
+    "",
+    "> ציטוט חשוב",
+    "",
+    "| שם | כמות |",
+    "| --- | --- |",
+    "| תפוח | 3 |",
+    "",
+    "- English item",
+    "- second item",
+  ].join("\n");
+  const dir = scratch(b, "hebrew");
+  const IMG = path.join(dir, "צילום מסך 2026.png"), UP = path.join(dir, "צילום מסך.png");
+  fs.writeFileSync(IMG, png(40, 30, [20, 160, 90]));
+  fs.writeFileSync(UP, "x".repeat(21));
+  await b.tool("call_say", { text: "The list and the picture are on your screen.", display: HEB, files: [IMG] });
+  await until(async () => (await screenPos(page)) === "1 of 1", 5000, "the On screen card");
+  await until(() => page.evaluate(() => { const t = document.querySelector("#screenBody figure img"); return t && t.complete && t.naturalWidth > 0; }), 5000, "the picture to load");
+  const v = await page.evaluate(() => {
+    const md = document.querySelector("#screenBody .md");
+    const d = (e) => (e.matches(":dir(rtl)") ? "rtl" : "ltr");
+    const q = md.querySelector("blockquote"), qs = getComputedStyle(q);
+    return {
+      lists: [...md.querySelectorAll(":scope > ul, :scope > ol")].map(d),
+      items: [...md.querySelectorAll("li")].map(d),
+      quote: d(q), bar: { left: qs.borderLeftWidth, right: qs.borderRightWidth },
+      table: d(md.querySelector("table")),
+      th: [...md.querySelectorAll("th")].map((x) => ({ t: x.textContent, x: Math.round(x.getBoundingClientRect().left) })),
+    };
+  });
+  check(v.lists.join() === "rtl,rtl,ltr" && v.items.join() === "rtl,rtl,rtl,ltr,ltr", "Hebrew lists read right to left (bullets on the right), the English one left to right", `${v.lists.join()} / ${v.items.join()}`);
+  check(v.quote === "rtl" && v.bar.right !== "0px" && v.bar.left === "0px", "a Hebrew quote reads right to left, with its bar on the right", JSON.stringify({ quote: v.quote, bar: v.bar }));
+  check(v.table === "rtl" && v.th.length === 2 && v.th[0].x > v.th[1].x, "a Hebrew table puts its first column on the right", JSON.stringify(v.th));
+
+  const imgSize = fs.statSync(IMG).size + " B";
+  const cap = await textBoxes(page, "#screenBody figure figcaption", ["צילום מסך", imgSize]);
+  check(cap && cap.name && cap.size && cap.size.left >= cap.name.right - 1, "the picture's caption shows the Hebrew name, then its size after it", JSON.stringify(cap));
+
+  await (await page.$("#fileInput")).uploadFile(UP);
+  await until(async () => (await readyChips(page)).length === 1, 8000, "the Hebrew-named chip");
+  const chipBox = await textBoxes(page, "#chips .chip .chip-text", ["צילום מסך", "21 B"]);
+  check(chipBox && chipBox.name && chipBox.size && chipBox.size.left >= chipBox.name.right - 1, "the chip shows the Hebrew name, then its size after it (not 'png · 21 B' in the middle)", JSON.stringify(chipBox));
+  info("screenshots: " + await shots(page, "hebrew-screen", "#screenBox") + ", " + await shots(page, "hebrew-chip", "#convoBox"));
+});
+
+def(19, "an upload still running: a spoken request waits for it, a typed one survives End call, and an ended page has no Stop buttons", async ({ b, page, check }) => {
+  const dir = scratch(b, "inflight");
+  const SHOT = path.join(dir, "screenshot.png"), BIG = path.join(dir, "recording.bin");
+  fs.writeFileSync(SHOT, crypto.randomBytes(1536 * 1024));
+  fs.writeFileSync(BIG, crypto.randomBytes(3 * 1024 * 1024));
+  const input = await page.$("#fileInput");
+
+  // "What is wrong in this screenshot?" said while the screenshot is still uploading.
+  await page.emulateNetworkConditions({ download: -1, upload: 300 * 1024, latency: 0 });
+  await input.uploadFile(SHOT);
+  await until(async () => (await chipTexts(page)).some((c) => c.startsWith("uploading screenshot.png")), 5000, "the screenshot to start uploading");
+  const r1 = await delegate(b, page, "What is wrong in this screenshot?", "del_s19");
+  await page.emulateNetworkConditions(null);
+  const with1 = sharedPaths(r1.text);
+  check(/^REQUEST r1 \(spoken/.test(r1.text) && with1.length === 1 && with1[0].endsWith("screenshot.png"), "the spoken request waited for the upload and took the screenshot with it", with1.join(" | ") || firstLine(r1.text));
+
+  // A typed request waiting for a slow upload when the user presses End call.
+  const TYPED = "Please rename the invoice folder to 2026";
+  await page.emulateNetworkConditions({ download: -1, upload: 100 * 1024, latency: 0 });
+  await input.uploadFile(BIG);
+  await until(async () => (await chipTexts(page)).some((c) => c.startsWith("uploading recording.bin")), 5000, "the recording to start uploading");
+  await page.type("#typed", TYPED);
+  await page.keyboard.press("Enter");
+  await until(async () => /as soon as the upload finishes/.test(await page.$eval("#attachNote", (el) => el.textContent)), 4000, "the typed request to wait for its upload");
+  const ended = timed(b.tool("call_next", { wait_seconds: 40 }));
+  await page.click("#go");
+  await until(async () => (await sent(page)).some((m) => m.type === "session.close"), 5000, "the page to close the voice session");
+  await live(page, { type: "session.closed", usage: { seconds: 20 } });
+  const end = await ended;
+  await page.emulateNetworkConditions(null);
+  check(/^CALL ENDED \(You ended the call\.\)/.test(end.text), "the call ended", firstLine(end.text));
+  check(end.text.includes("User (NOT HANDED OVER to you during the call): (typed on the call page, never sent: the call ended while it waited for an upload) " + TYPED),
+    "the typed request that never went out is in the end-of-call hand-off as not handed over", (end.text.split("\n").find((l) => l.includes(TYPED)) || "missing").slice(0, 220));
+  const after = await page.evaluate(() => ({ box: document.getElementById("typed").value, log: [...document.querySelectorAll("#log li")].map((li) => li.textContent) }));
+  check(after.box === TYPED, "the typed text is back in the box", JSON.stringify(after.box));
+  check(after.log.some((l) => l === "Callnot sent, the call ended first: " + TYPED) && after.log.some((l) => l === "Callthe call ended before recording.bin finished uploading, so it was not shared"),
+    "the log says the request was not sent and the file was not shared", after.log.filter((l) => /not sent|not shared/.test(l)).join(" | ") || "nothing");
+
+  // r1 was still open when the call ended. A reload of the ended page offers no Stop for it.
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await sleep(1200);
+  const reloaded = await page.evaluate(() => ({ stops: document.querySelectorAll("#reqs button").length, hidden: document.getElementById("reqs").hidden, status: document.getElementById("status").textContent }));
+  check(reloaded.stops === 0 && reloaded.hidden && reloaded.status === "This call has ended.", "a reloaded ended page lists no open requests and no Stop buttons", JSON.stringify(reloaded));
 });
 
 /* ---------------------------------------------------------------- run -- */

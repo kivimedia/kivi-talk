@@ -229,8 +229,10 @@ function claudeStatus(c) {
 }
 
 /* The page's Requests list (each with a Stop button), oldest first. The text is a glance, not a
-   record: redacted and short. "stopping" is work the user cancelled that Claude has not closed. */
+   record: redacted and short. "stopping" is work the user cancelled that Claude has not closed.
+   Empty once the call has ended: nothing can be stopped then (the hand-off lists what was open). */
 function requestItems(c) {
+  if (!isOpen(c)) return [];
   return [...c.inFlight.values(), ...c.queue].sort((a, b) => a.n - b.n).map((r) => ({
     id: r.id,
     state: !c.inFlight.has(r.id) ? "queued" : r.cancelled ? "stopping" : "working",
@@ -360,7 +362,7 @@ function deliver(c, r) {
     "",
     `Do this now, as if the user had typed it here. When you have the answer, call call_say with id "${r.id}": answer out loud in 1-3 plain sentences, and put code, commands, file paths, links, tables, lists and anything longer on screen with \`display\` (and screenshots or files with \`files\`).`,
     "If it will take more than about 15 seconds, first call call_say with final=false and a one-line progress note.",
-    "Before anything destructive or outward-facing, call call_confirm with the exact action and do it only if it comes back APPROVED.",
+    `Before anything destructive or outward-facing, call call_confirm with id "${r.id}" and the exact action, and do it only if it comes back APPROVED.`,
     "Then call call_next again.",
   ].join("\n"));
 }
@@ -1155,6 +1157,20 @@ function servedType(name) {
   return "application/octet-stream";
 }
 
+/* A path on another machine (\\host\share, //host/share, \\?\UNC\...) or a device (\\.\...) is
+   never looked at. On Windows even a stat of one makes the system connect to that host and offer
+   the user's credentials, a host name leaks in the DNS lookup, and call_say runs without a
+   permission prompt. So: a drive-letter path on Windows, nothing under the network automount on
+   macOS, and never a path that starts with two slashes. */
+export function isLocalPath(p) {
+  const s = String(p || "");
+  if (/^[\\/]{2}/.test(s)) return false;
+  if (process.platform === "win32") return /^[A-Za-z]:[\\/]/.test(s);
+  if (process.platform === "darwin") return !/^\/(?:net|Network)(?:\/|$)/i.test(s);
+  return true;
+}
+const NOT_LOCAL = (given) => `"${given}" is not a file on this computer: only a full local path${process.platform === "win32" ? " with a drive letter (C:\\...)" : ""} can be shown, never a network or device path. Nothing was sent.`;
+
 /* call_say's files: every one is checked before any is shown, so a bad path is a clear error and
    never half an answer on screen. */
 function checkFiles(list) {
@@ -1165,13 +1181,18 @@ function checkFiles(list) {
   for (const p of list) {
     const given = String(p || "");
     if (!given || !path.isAbsolute(given)) return { error: `"${given}" is not an absolute path. Nothing was sent.` };
+    if (!isLocalPath(given)) return { error: NOT_LOCAL(given) };
     let real, st;
-    try { real = fs.realpathSync(given); st = fs.statSync(real); }
+    try { real = fs.realpathSync(given); }
+    catch { return { error: `${given} does not exist. Nothing was sent.` }; }
+    // A link on a local drive that points at a share is a share.
+    if (!isLocalPath(real)) return { error: NOT_LOCAL(given) };
+    try { st = fs.statSync(real); }
     catch { return { error: `${given} does not exist. Nothing was sent.` }; }
     if (!st.isFile()) return { error: `${given} is not a regular file. Nothing was sent.` };
     if (st.size > FILE_MAX) return { error: `${given} is over the 25 MiB limit per file (${st.size} bytes). Nothing was sent.` };
     const name = path.basename(given);
-    out.push({ path: real, name, type: typeOf(name), size: st.size, image: IMAGE_EXT.has(extOf(name)) });
+    out.push({ path: real, name, type: typeOf(name), size: st.size, image: IMAGE_EXT.has(extOf(name)), download: servedType(name) === "application/octet-stream" });
   }
   return { files: out };
 }
@@ -1194,22 +1215,48 @@ const rfc5987 = (s) => encodeURIComponent(s).replace(/['()*]/g, (ch) => "%" + ch
 function serveFile(res, c, token) {
   const f = c.shared.get(token);
   let st = null;
-  try { st = f ? fs.statSync(f.path) : null; } catch {}
+  try { st = f && isLocalPath(f.path) ? fs.statSync(f.path) : null; } catch {}
   if (!st || !st.isFile()) return sendJson(res, 404, { error: f ? "that file is no longer there" : "no such file" });
+  if (st.size > FILE_MAX) return sendJson(res, 413, { error: "that file has grown past the 25 MiB limit since it was shared" });
+  /* A file that says it is empty may not be: on Linux /proc and /sys files report size 0 and still
+     have content. Read it (up to the cap) and send what was really there, so the length announced
+     is the length sent. */
+  let body = null;
+  if (!st.size) {
+    try { body = readCapped(f.path, FILE_MAX + 1); } catch { return sendJson(res, 404, { error: "that file is no longer there" }); }
+    if (body.length > FILE_MAX) return sendJson(res, 413, { error: "that file is over the 25 MiB limit" });
+  }
   const type = servedType(f.name);
   const headers = {
     ...SECURITY_HEADERS,
     "content-type": type,
-    "content-length": st.size,
+    "content-length": body ? body.length : st.size,
     "content-security-policy": FILE_CSP,
     "x-content-type-options": "nosniff",
   };
   if (type === "application/octet-stream") headers["content-disposition"] = `attachment; filename*=UTF-8''${rfc5987(f.name)}`;
   res.writeHead(200, headers);
+  if (body) return res.end(body);
   // Exactly the size just announced, even if the file grows while it is read.
-  const s = fs.createReadStream(f.path, st.size ? { start: 0, end: st.size - 1 } : {});
+  const s = fs.createReadStream(f.path, { start: 0, end: st.size - 1 });
   s.on("error", () => res.destroy());
   s.pipe(res);
+}
+
+function readCapped(p, max) {
+  const fd = fs.openSync(p, "r");
+  try {
+    const parts = [];
+    let got = 0;
+    for (;;) {
+      const buf = Buffer.alloc(Math.min(65536, max - got));
+      const n = buf.length ? fs.readSync(fd, buf, 0, buf.length, null) : 0;
+      if (!n) break;
+      parts.push(buf.subarray(0, n));
+      got += n;
+    }
+    return Buffer.concat(parts);
+  } finally { fs.closeSync(fd); }
 }
 
 const pendingUploads = (c) => c.uploads.filter((u) => !u.r);
@@ -1219,14 +1266,18 @@ const uploadDirPath = (c) => path.join(UPLOADS_DIR, c.id);
 
 /* Names the user's own browser sends, so they are only a label: the basename, letters and digits
    of any script (with their marks), ". _ - space", no leading dot (hidden files), no trailing dot
-   or space (Windows drops them), at most 100 characters with the extension kept. */
+   or space (Windows drops them), at most 100 characters and 200 bytes with the extension kept.
+   Bytes too: Linux allows 255 bytes per name, and 100 Chinese characters are 300 of them. */
+const NAME_BYTES = 200;
 export function safeUploadName(raw) {
   let s = String(raw || "").split(/[\\/]/).pop().normalize("NFC");
   s = s.replace(/[^\p{L}\p{N}\p{M}._ -]/gu, "").replace(/^[. ]+/, "").replace(/[. ]+$/, "");
   const chars = Array.from(s);
-  if (chars.length > 100) {
-    const ext = Array.from((s.match(/\.[\p{L}\p{N}]{1,16}$/u) || [""])[0]);
-    s = chars.slice(0, 100 - ext.length).join("").replace(/[. ]+$/, "") + ext.join("");
+  if (chars.length > 100 || Buffer.byteLength(s) > NAME_BYTES) {
+    const ext = (s.match(/\.[\p{L}\p{N}]{1,16}$/u) || [""])[0];
+    const stem = Array.from(s.slice(0, s.length - ext.length)).slice(0, 100 - Array.from(ext).length);
+    while (stem.length && Buffer.byteLength(stem.join("") + ext) > NAME_BYTES) stem.pop();
+    s = stem.join("").replace(/[. ]+$/, "") + ext;
   }
   return s || "file";
 }
@@ -1320,14 +1371,19 @@ function postUpload(req, res, c) {
     req.on("end", () => {
       ended = true;
       if (over || gone || settled) return;
-      out.end(() => settle(() => {
-        if (!isOpen(c)) { fs.rm(file, { force: true }, () => {}); return sendJson(res, 409, { error: "the call has ended" }); }
-        try { fs.chmodSync(file, 0o600); } catch {}
-        const u = { id: "f" + n, name, size, type, path: file, r: null };
-        c.uploads.push(u);
-        pushAttachments(c);
-        sendJson(res, 200, { id: u.id, name, size, type });
-      }));
+      /* A last write that fails (disk full) reaches this callback, with its error, before the stream's
+         own "error" event: that one removes the file and answers 500, so this must not say 200 first. */
+      out.end((err) => {
+        if (err || gone) return;
+        settle(() => {
+          if (!isOpen(c)) { fs.rm(file, { force: true }, () => {}); return sendJson(res, 409, { error: "the call has ended" }); }
+          try { fs.chmodSync(file, 0o600); } catch {}
+          const u = { id: "f" + n, name, size, type, path: file, r: null };
+          c.uploads.push(u);
+          pushAttachments(c);
+          sendJson(res, 200, { id: u.id, name, size, type });
+        });
+      });
     });
     req.on("error", () => {});
     // The browser gave up (tab closed, upload cancelled): nothing half-written stays.
@@ -1341,7 +1397,8 @@ function postRemoveUpload(res, c, body) {
   if (!u) return sendJson(res, 404, { error: "that file is not waiting to be sent" });
   c.uploads.splice(c.uploads.indexOf(u), 1);
   try { fs.unlinkSync(u.path); } catch {}
-  pushAttachments(c);
+  // Named as removed, so another tab of this call does not take its leaving for a file that was sent.
+  push({ ...attachmentsFrame(c), removed: [u.id] });
   return sendJson(res, 200, { ok: true });
 }
 
@@ -1442,7 +1499,7 @@ export const TOOLS = [
       properties: {
         text: { type: "string", description: "What to tell the user out loud, 1-3 short spoken sentences. If you also show something, say so (for example \"The diff is on your screen.\")." },
         display: { type: "string", description: "Optional markdown for the call page's On screen card: code, commands, file paths, links, tables, lists, anything longer than a sentence. Shown exactly as written (so leave secrets out), stays on this computer, never spoken. Up to 100,000 characters." },
-        files: { type: "array", items: { type: "string" }, maxItems: SAY_FILES_MAX, description: "Optional absolute paths of local files to show on the call page: screenshots and images appear as pictures, other files open in a new tab. Up to 10, each a regular file of at most 25 MiB." },
+        files: { type: "array", items: { type: "string" }, maxItems: SAY_FILES_MAX, description: "Optional absolute paths of local files to show on the call page (on Windows with a drive letter; network paths are refused): screenshots and images appear as pictures, PDFs and text or code files open in a new tab, and anything else downloads (Office files, archives, audio, video). Up to 10, each a regular file of at most 25 MiB." },
         id: { type: "string", description: "The request id from call_next (for example r3). Defaults to the latest request." },
         final: { type: "boolean", description: "true = this answers the request (default). false = progress note, still working." },
         quiet: { type: "boolean", description: "true = close the request WITHOUT speaking: only for something the voice kept to itself and already answered well (small talk), so the user does not hear it twice." },
@@ -1458,6 +1515,7 @@ export const TOOLS = [
       properties: {
         action: { type: "string", description: "The exact action, as specific as a command line: what, where, which files or recipients." },
         why: { type: "string", description: "One short spoken sentence saying what you want to do, for the voice to tell the user." },
+        id: { type: "string", description: "The request this action is for (for example r3). Pass it: a request the user cancelled is declined at once, and another one's cancel never declines this one. Defaults to the newest request still wanted." },
       },
       required: ["action", "why"],
     },
@@ -1550,10 +1608,18 @@ async function runTool(name, args, ctx) {
     const action = String(args.action || "").trim().slice(0, 1200);
     const why = speakable(args.why || "").slice(0, 300);
     if (!action) return fail("action is required: the exact thing you want to do.");
-    // The request this approval belongs to, so the end-of-call hand-off can say how it went.
-    const r = [...c.inFlight.values()].at(-1) || null;
+    /* The request this approval belongs to, so the end-of-call hand-off can say how it went: the one
+       Claude names, else the newest one the user still wants. */
+    const open = [...c.inFlight.values()];
+    const r = args.id ? (c.inFlight.get(String(args.id)) || null) : (open.filter((q) => !q.cancelled).at(-1) || open.at(-1) || null);
     // Work the user already stopped on the page has nothing left to approve: no card.
     if (r && r.cancelled) return text(`DECLINED: the user cancelled ${r.id} on the call. Do not do it.`);
+    /* A stop Claude has not heard yet may be for the very work this step belongs to, and a card
+       would hold that news back for as long as the card waits. So no card: toolCall puts the STOP
+       in front of this, and Claude asks again if the action is for work still wanted. */
+    if (open.some((q) => q.cancelled && !q.told)) {
+      return text("DECLINED: no card was shown, because the user cancelled a request you have not heard about yet (above). Do not do this if it is part of that work. If it is for a request that is still open, call call_confirm again with that request's id.");
+    }
     if (!c.sse.size) return text("DECLINED: the call page is not connected, so the user cannot see the action. Do not do it; ask again once the page is back.");
     const id = "k" + crypto.randomBytes(4).toString("hex");
     remember(c, "system", `confirmation ${id} asked: ${action}`);
@@ -1580,6 +1646,9 @@ async function runTool(name, args, ctx) {
     // Ended first: a request still queued when the user hung up is reported, not run.
     if (!isOpen(c)) return endedResult(c);
     if (c.queue.length) return deliver(c, c.queue.shift());
+    /* A stop that came while nothing was waiting is news now, not after a wait of up to 20 minutes:
+       toolCall puts the STOP in front, exactly as for a call_next that was already waiting. */
+    if ([...c.inFlight.values()].some((q) => q.cancelled && !q.told)) return text("Then call call_next again.");
     // Under the plugin's 30-minute per-call timeout (.mcp.json), which progress does not extend.
     const wait = Math.min(Math.max(Number(args.wait_seconds) || NEXT_WAIT_DEFAULT, 5), 1500);
     if (c.waiter) { const old = c.waiter; c.waiter = null; old.resolve(text("Superseded: a newer call_next is waiting now. Ignore this result.")); }
@@ -1623,7 +1692,7 @@ async function runTool(name, args, ctx) {
     const files = checked.files.map((f) => {
       const token = crypto.randomBytes(24).toString("base64url");
       c.shared.set(token, f);
-      return { token, name: f.name, type: f.type, size: f.size, image: f.image };
+      return { token, name: f.name, type: f.type, size: f.size, image: f.image, download: f.download };
     });
     const final = args.final !== false;
     /* An explicit id that is no longer in flight (already answered, or never existed) must not
@@ -1633,12 +1702,18 @@ async function runTool(name, args, ctx) {
     const quiet = final && args.quiet === true;
     const delivered = push({ type: "say", id: r ? r.id : null, text: said, final, quiet, delegationIds: r ? r.delegationIds : [], display, files });
     remember(c, "claude", (quiet ? "(closed quietly) " : final ? "" : "(progress) ") + said);
+    /* Closing a request the user cancelled a moment ago: it leaves the in-flight list here, where
+       toolCall looks for untold stops, so the notice goes out with this result instead. */
+    const lateStop = final && r && r.cancelled && !r.told
+      ? `STOP ${r.id}: the user cancelled "${clip(r.text, 200).replace(/"/g, "'")}" on the call before this answer went out. Your answer was still sent. Do not undo anything unless they ask. If it did not already say what, if anything, was changed, say that in one short call_say line.\n\n`
+      : "";
+    if (lateStop) r.told = true;
     if (final && r) { c.inFlight.delete(r.id); c.lastAnswered = { r, at: Date.now() }; }
     pushStatus();
     const shown = display || files.length ? ` and shown on screen${files.length ? ` with ${files.length} file(s)` : ""}` : "";
-    return text(delivered
+    return text(lateStop + (delivered
       ? `Sent to the call${r ? ` as the ${final ? "answer to" : "progress on"} ${r.id}` : ""}${shown}. Now call call_next.`
-      : `The call page is reconnecting; this will be spoken${shown ? " and shown" : ""} when it is back. Now call call_next.`);
+      : `The call page is reconnecting; this will be spoken${shown ? " and shown" : ""} when it is back. Now call call_next.`));
   }
 
   if (name === "call_instruct") {

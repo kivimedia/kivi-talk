@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { startBridge, mockOpenAI, post, sleep, upload, rawUpload, tmpDir } from "./helpers.mjs";
+import { pathToFileURL } from "node:url";
+import { startBridge, mockOpenAI, post, sleep, upload, rawUpload, tmpDir, ROOT } from "./helpers.mjs";
 import { speakable, redactSecrets, fitSpoken, estimateTokens, peerUidFromTable, instructMode } from "../server/bridge.mjs";
 import * as bridgeMod from "../server/bridge.mjs";
 
@@ -1307,4 +1308,302 @@ test("the voice briefing covers the screen, files the user shares, and cancellin
     assert.match(brief, /just say "Cancelled\."/);
     assert.ok(brief.length < 16000 * 3);
   } finally { b.stop(); oa.close(); }
+});
+
+/* ------------------------------------------- 0.6.0 review: fixes -- */
+
+const ls = (d) => (fs.existsSync(d) ? fs.readdirSync(d) : []);
+async function until(fn, ms, what) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > ms) throw new Error("timed out waiting for " + what);
+    await sleep(25);
+  }
+}
+const nextPending = (page) => until(async () => (await (await page.get("status")).json()).nextPending, 10000, "call_next to be waiting");
+// The bridge with a disk fault (test/fault-preload.mjs); a file URL has no spaces, so NODE_OPTIONS takes it as is.
+const faulty = (fault) => ({ NODE_OPTIONS: "--import=" + pathToFileURL(path.join(ROOT, "test", "fault-preload.mjs")).href, TTC_TEST_FAULT: fault });
+
+/* An upload that declares `total` bytes and sends only `first`: the caller then finishes it, or drops it. */
+function partialUpload(page, name, total, first) {
+  const u = new URL(page.base + "upload");
+  let done;
+  const res = new Promise((r) => { done = r; });
+  const req = http.request({
+    host: u.hostname, port: u.port, path: u.pathname, method: "POST", agent: false,
+    headers: { cookie: page.cookie, "content-type": "application/octet-stream", "x-ttc-name": name, "content-length": total },
+  }, (r) => { let body = ""; r.setEncoding("utf8"); r.on("data", (c) => { body += c; }); r.on("end", () => done({ status: r.statusCode, body })); });
+  req.on("error", (e) => done({ status: 0, error: e.code }));
+  req.write(Buffer.alloc(first, 97));
+  return { req, res, rest: () => req.end(Buffer.alloc(total - first, 98)) };
+}
+
+test("call_say files refuse a network or device path at once, without touching the network", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    const paths = ["\\\\192.0.2.10\\share\\chart.png", "//192.0.2.10/share/chart.png", "\\\\?\\UNC\\192.0.2.10\\share\\x.png", "\\\\.\\PhysicalDrive0"];
+    if (process.platform === "win32") paths.push("\\Windows\\win.ini");   // absolute on Windows, but no drive letter
+    for (const p of paths) {
+      const t0 = Date.now();
+      const r = await toolRaw(b, "call_say", { text: "Here.", files: [p] });
+      const took = Date.now() - t0;
+      assert.equal(r.isError, true, p);
+      assert.match(r.text, /Nothing was sent\.$/, p);
+      if (process.platform === "win32") assert.match(r.text, /not a file on this computer/, p);
+      assert.ok(took < 2000, `${p} refused in ${took} ms, not after a network timeout`);
+    }
+    await sleep(100);
+    assert.ok(!events.frames.some((f) => f.type === "say"), "nothing was pushed");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("call_confirm takes the request id: cancelled work gets no card, and the STOP is told at once", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    const schema = (await b.rpc("tools/list", {})).result.tools.find((t) => t.name === "call_confirm").inputSchema;
+    assert.equal(schema.properties.id.type, "string");
+    await page.post("typed", { text: "delete the old backups folder" });
+    assert.match(await b.tool("call_next", { wait_seconds: 5 }), /call_confirm with id "r1"/, "the request says which id to pass");
+    await page.post("typed", { text: "check the weather" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r2, while r1 is still in flight
+    await page.post("cancel", { id: "r1" });
+    const t0 = Date.now();
+    const a = await b.tool("call_confirm", { action: "rm -rf ~/backups/old", why: "Clean up." });
+    assert.ok(Date.now() - t0 < 3000, "answered at once, not after the card's wait");
+    assert.match(a, /^STOP r1: the user cancelled "delete the old backups folder"/);
+    assert.match(a, /\n\nDECLINED: /);
+    await sleep(100);
+    assert.ok(!events.frames.some((f) => f.type === "confirm"), "no approval card while a stop is untold");
+    // Told now. r2 is still wanted, and its approval is asked with its own id.
+    const asked = b.tool("call_confirm", { id: "r2", action: "curl wttr.in", why: "Check the weather." });
+    const card = await events.waitFor((f) => f.type === "confirm");
+    assert.equal(card.action, "curl wttr.in");
+    await page.post("confirm", { id: card.id, approved: true });
+    assert.match(await asked, /^APPROVED: /);
+    assert.match(await b.tool("call_confirm", { id: "r1", action: "rm -rf ~/backups/old", why: "Clean up." }),
+      /^DECLINED: the user cancelled r1 on the call\. Do not do it\.$/, "the cancelled one, by id");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("call_confirm for live work is not declined because a different request was cancelled", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: "deploy the site" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1
+    await page.post("typed", { text: "also check the logs" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r2
+    await page.post("cancel", { id: "r2" });
+    const first = await b.tool("call_confirm", { id: "r1", action: "vercel deploy --prod", why: "Deploy." });
+    assert.match(first, /^STOP r2: /, "the stop is told first, with no card in its way");
+    assert.doesNotMatch(first, /cancelled r1/);
+    for (const args of [{ id: "r1" }, {}]) {   // by id, and without one (the newest request still wanted)
+      const seen = events.frames.length;
+      const asked = b.tool("call_confirm", { ...args, action: "vercel deploy --prod", why: "Deploy." });
+      const card = await events.waitFor((f) => f.type === "confirm" && events.frames.indexOf(f) >= seen);
+      await page.post("confirm", { id: card.id, approved: true });
+      assert.match(await asked, /^APPROVED: the user clicked Approve on the call page for exactly this: vercel deploy --prod$/, JSON.stringify(args));
+    }
+  } finally { await events.close(); b.stop(); }
+});
+
+test("a call_next that starts after an in-flight cancel returns the STOP at once, not after its wait", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "long job" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight, nothing waiting
+    await page.post("cancel", { id: "r1" });                  // no waiter, so nobody is told yet
+    const t0 = Date.now();
+    const got = await b.tool("call_next", { wait_seconds: 20 });
+    assert.ok(Date.now() - t0 < 3000, `told at once (took ${Date.now() - t0} ms)`);
+    assert.match(got, /^STOP r1: the user cancelled "long job" on the call\.[^\n]*\n\nThen call call_next again\.$/);
+  } finally { b.stop(); }
+});
+
+test("a final call_say for a request cancelled a moment ago still tells Claude it was cancelled", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await page.post("typed", { text: "delete the old branch" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await page.post("cancel", { id: "r1" });
+    const said = await b.tool("call_say", { id: "r1", text: "Done, the old branch is deleted." });
+    assert.match(said, /^STOP r1: the user cancelled "delete the old branch" on the call before this answer went out\./);
+    assert.match(said, /Sent to the call as the answer to r1/);
+    assert.doesNotMatch(await b.tool("call_next", { wait_seconds: 5 }), /STOP/, "told once");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("once the call has ended the page gets no open requests (no Stop buttons on an ended call)", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "do the first thing" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await page.post("typed", { text: "do the second thing" });
+    await page.post("state", { state: "closed", reason: "bye" });
+    const again = page.sse();
+    try {
+      const hello = await again.waitFor(isHello);
+      assert.equal(hello.state, "ended");
+      assert.deepEqual(hello.items, []);
+    } finally { await again.close(); }
+    assert.match(await (await page.get("")).text(), /"items":\[\]/, "the page config has none either");
+    const st = JSON.parse(await b.tool("call_status"));
+    assert.deepEqual(st.items, []);
+    assert.deepEqual([st.inFlight.map((r) => r.id), st.queued.map((r) => r.id)], [["r1"], ["r2"]], "call_status still says what was left open");
+  } finally { b.stop(); }
+});
+
+test("an upload whose last write fails (disk full) is answered 500 and never handed to Claude", async () => {
+  const { b, page } = await started(faulty("enospc:FAILME"));
+  try {
+    const r = await upload(page, "FAILME.txt", "hello world");
+    assert.equal(r.status, 500, r.text);
+    assert.match(r.json.error, /ENOSPC/);
+    assert.deepEqual(ls(uploadsOf(b, page)), [], "nothing left on disk");
+    assert.equal((await page.post("typed", { text: "" })).status, 400, "no file is waiting");
+    await page.post("typed", { text: "look at it" });
+    assert.doesNotMatch(await b.tool("call_next", { wait_seconds: 5 }), /FAILME|Files the user shared/);
+  } finally { b.stop(); }
+});
+
+test("a shared file that reports size 0 but has content (Linux /proc) is served whole, with its real length", async () => {
+  const { b, page } = await started(faulty("zerostat:ZEROSTAT"));
+  const events = page.sse();
+  const p = path.join(tmpDir("share"), "ZEROSTAT-meminfo.txt");
+  fs.writeFileSync(p, "MemTotal: 32 GB\n");
+  try {
+    await events.waitFor(isHello);
+    await b.tool("call_say", { text: "Here.", files: [p] });
+    const say = await events.waitFor((f) => f.type === "say");
+    assert.equal(say.files[0].size, 0, "the fault is in place");
+    const r = await page.get("file/" + say.files[0].token);
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get("content-length"), "16");
+    assert.equal(await r.text(), "MemTotal: 32 GB\n");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("upload names fit a Linux file name (255 bytes) with room for the number in front", () => {
+  const n = bridgeMod.safeUploadName;
+  for (const raw of ["会议记录".repeat(40) + ".pdf", "\u{20000}".repeat(120) + ".png", "דוח".repeat(60) + ".docx"]) {
+    const s = n(raw);
+    assert.ok(Buffer.byteLength(s) <= 200 && Buffer.byteLength("20-" + s) <= 255, `${Buffer.byteLength(s)} bytes`);
+    assert.equal(s.slice(s.lastIndexOf(".")), raw.slice(raw.lastIndexOf(".")), "the extension is kept");
+    assert.ok(!/[\uD800-\uDFFF]/.test(s.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "")), "no half character");
+  }
+  assert.equal(n("x".repeat(150) + ".png"), "x".repeat(96) + ".png", "a Latin name still stops at 100 characters");
+});
+
+test("a file removed on the page is marked removed in the attachments frame, so another tab does not call it shared", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  try {
+    await events.waitFor(isHello);
+    await upload(page, "a.png", PNG);
+    await upload(page, "b.png", PNG);
+    await page.post("attachments/remove", { id: "f1" });
+    const frame = await events.waitFor((f) => f.type === "attachments" && f.pending.map((p) => p.id).join() === "f2");
+    assert.deepEqual(frame.removed, ["f1"]);
+    await page.post("typed", { text: "look" });
+    const taken = await events.waitFor((f) => f.type === "attachments" && f.pending.length === 0);
+    assert.equal(taken.removed, undefined, "files a request took are not removed ones");
+  } finally { await events.close(); b.stop(); }
+});
+
+test("a shared file the browser can only download is flagged, and the tool says so", async () => {
+  const { b, page } = await started();
+  const events = page.sse();
+  const dir = tmpDir("share");
+  const files = ["report.docx", "build.zip", "shot.png", "notes.md", "doc.pdf"].map((n) => { const p = path.join(dir, n); fs.writeFileSync(p, "x"); return p; });
+  try {
+    const say = (await b.rpc("tools/list", {})).result.tools.find((t) => t.name === "call_say");
+    assert.match(say.inputSchema.properties.files.description, /anything else downloads/);
+    await events.waitFor(isHello);
+    await b.tool("call_say", { text: "Here.", files });
+    const f = await events.waitFor((x) => x.type === "say");
+    assert.deepEqual(f.files.map((x) => [x.name, x.download === true]),
+      [["report.docx", true], ["build.zip", true], ["shot.png", false], ["notes.md", false], ["doc.pdf", false]]);
+  } finally { await events.close(); b.stop(); }
+});
+
+test("an upload the browser abandons halfway leaves no file and frees its slot", async () => {
+  const { b, page } = await started();
+  try {
+    const dir = uploadsOf(b, page);
+    const p = partialUpload(page, "half.bin", 1 << 20, 64 * 1024);
+    await until(() => ls(dir).length === 1, 10000, "the partial file to appear");
+    p.req.destroy();
+    await until(() => ls(dir).length === 0, 5000, "the partial file to be removed").catch(() => {});
+    assert.deepEqual(ls(dir), [], "nothing half-written stays");
+    for (let i = 1; i <= 20; i++) assert.equal((await upload(page, `f${i}.txt`, "x")).status, 200, `upload ${i} after the abort`);
+  } finally { b.stop(); }
+});
+
+test("an upload still arriving when the call ends is refused with 409 and deleted", async () => {
+  const { b, page } = await started();
+  try {
+    const dir = uploadsOf(b, page);
+    const p = partialUpload(page, "late.bin", 256 * 1024, 64 * 1024);
+    await until(() => ls(dir).length === 1, 10000, "the partial file to appear");
+    await page.post("state", { state: "closed", reason: "bye" });
+    p.rest();
+    const r = await p.res;
+    assert.equal(r.status, 409, JSON.stringify(r));
+    await until(() => ls(dir).length === 0, 5000, "the file to be removed").catch(() => {});
+    assert.deepEqual(ls(dir), []);
+  } finally { b.stop(); }
+});
+
+test("a Superseded call_next result never carries (and so never uses up) a STOP notice", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "long job" });
+    await b.tool("call_next", { wait_seconds: 5 });            // r1 in flight
+    const a = b.tool("call_next", { wait_seconds: 60 });
+    await nextPending(page);
+    const next = b.tool("call_next", { wait_seconds: 60 });    // supersedes a
+    const first = await a;
+    assert.match(first, /^Superseded:/);
+    await nextPending(page);
+    await page.post("cancel", { id: "r1" });
+    assert.doesNotMatch(first, /STOP/);
+    assert.match(await next, /^STOP r1: [\s\S]*\n\nThen call call_next again\.$/, "the notice goes to the call_next Claude reads");
+  } finally { b.stop(); }
+});
+
+test("a page that reconnects gets the files still waiting, so its chips come back", async () => {
+  const { b, page } = await started();
+  const one = page.sse();
+  try {
+    await one.waitFor(isHello);
+    await upload(page, "a.txt", "x");
+    await one.waitFor((f) => f.type === "attachments" && f.pending.length === 1);
+    await one.close();
+    const two = page.sse();
+    try {
+      const att = await two.waitFor((f) => f.type === "attachments", 5000);
+      assert.deepEqual(att.pending.map((p) => p.name), ["a.txt"]);
+    } finally { await two.close(); }
+  } finally { b.stop(); }
+});
+
+test("an empty hand-over right after a Stop does not attach to the stopped request", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("typed", { text: "long job" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await page.post("cancel", { id: "r1" });
+    const r = await page.post("delegate", { delegation_id: "d9", said: [], recent: [] });
+    assert.notEqual(r.json && r.json.id, "r1", JSON.stringify(r.json));
+    assert.equal(r.status, 400);
+  } finally { b.stop(); }
 });

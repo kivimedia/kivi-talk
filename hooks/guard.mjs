@@ -123,7 +123,7 @@ async function main() {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "allow",
-        permissionDecisionReason: "kivi-talk call tool (only drives the voice call)",
+        permissionDecisionReason: "kivi-talk call tool (drives the voice call and its local call page)",
       },
     });
     return;

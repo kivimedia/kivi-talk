@@ -9,7 +9,10 @@ commands. That is the point of it, and it is also why the defaults below exist.
 |---|---|
 | Your microphone audio during a call | Your files, code and command output |
 | What Claude says out loud (short spoken answers) | Claude's full work and reasoning |
-| The call instructions (project folder name, the focus you typed) | Call transcripts (`calls/*.jsonl` in the plugin data folder), only if you turn them on |
+| The call instructions (project folder name, the focus you typed) | What Claude puts on the call page's **On screen** card (code, links, tables, pictures) |
+| The text of your requests, with anything that looks like a key or password masked, so the voice can follow the conversation | Files in both directions and their names: what Claude shares with you and what you share with Claude |
+| Short generic notes such as "Claude put details on the user's screen" or "the user attached 2 files", never the content | Files you share, saved in the plugin data folder under `uploads/<call id>/` (owner-only permissions on macOS and Linux), kept after the call so Claude can finish with them, and deleted after 7 days, at the start of a later call |
+| | Call transcripts (`calls/*.jsonl` in the plugin data folder), only if you turn them on. What is on screen is never written to them. |
 
 When a call ends, the whole conversation (what the microphone heard, what the voice said, what
 Claude said) is handed to your Claude session so Claude can finish what you asked for. That puts
@@ -22,13 +25,25 @@ parties, check before using it on that code.
 
 ## The local bridge
 
-- Listens on `127.0.0.1` only, on a random port, for the life of your Claude session.
-- Every URL carries a random 192-bit token created for that call; nothing is served without it.
+- Listens on `127.0.0.1` only, on a random port, for the life of your Claude session. On Linux it
+  also refuses connections from other accounts on the same computer.
+- The call page opens only through a one-time link (a random 192-bit code, dead after its first
+  use). Opening it sets an HttpOnly, SameSite=Strict cookie, scoped to that call's path, holding a
+  separate 256-bit secret that is never printed or put in a URL; nothing under the call is served
+  without it. Asking Claude for a fresh link rotates the secret and cuts off any older page. The
+  plugin's own hooks use a third token, handed over in a file only you can read, and it opens the
+  call's status and notices only.
 - Refuses requests whose `Host` is not `127.0.0.1`/`localhost` on that port (blocks DNS
-  rebinding), refuses any cross-site `Origin`, sends no CORS headers, and only accepts
-  `application/json` POSTs (a web page cannot forge them without a preflight that is never
-  answered).
-- The page runs under a strict Content Security Policy (no external scripts, no framing).
+  rebinding), refuses any cross-site `Origin`, and sends no CORS headers. Every POST must be
+  `application/json`, except `POST /upload` (a file you share on the page), which must be
+  `application/octet-stream`. A web page cannot send either type cross-site without a preflight,
+  and the bridge never answers one. Uploads are capped at 25 MiB each and 20 waiting at a time.
+- `GET /file/<token>` serves a file Claude shared, to the call page only (the hooks' token cannot
+  read files). Each file is served as a picture, a PDF, plain text or a download, never as a page:
+  under a sandbox Content Security Policy (no scripts run, not even in an SVG) and with nosniff.
+- The page runs under a strict Content Security Policy (no external scripts, no framing). What
+  Claude puts on screen is untrusted text: it is drawn without ever parsing HTML, and only http,
+  https and mailto links are live.
 - The OpenAI key is read by the bridge only. It is never sent to the page or written to logs.
 
 ## Voice-specific risks
@@ -42,14 +57,24 @@ parties, check before using it on that code.
   answer; something you declined on the call is never redone. Your Claude Code permission rules
   still apply on top. Use headphones and hang up when you are done.
 - **Speech recognition can mishear.** Claude is told to ask when a request is ambiguous.
-- **Content Claude reads is not you.** Instructions found inside files, web pages or tool output
-  are treated as data. Only requests that arrive through the call are yours.
+- **Content Claude reads is not you.** Instructions found inside files (including files shared on
+  the call page), web pages or tool output are treated as data. Only requests that arrive through
+  the call are yours.
 
 ## Permissions
 
-The plugin approves only its own `call_*` tools (they only drive the call). Everything else goes
-through your normal Claude Code permission mode. For hands-free work, a mode that auto-approves
-more is your choice to make; the plugin never changes it.
+The plugin approves only its own `call_*` tools, without a prompt. They drive the call and its
+page: they cannot run commands or change files. `call_say` can show a local file Claude names on
+the call page, on this computer only, the way Claude could paste it into the chat; network and
+device paths (such as `\\server\share`) are refused before anything touches them, because on
+Windows even looking one up would make the computer connect to that server with your credentials.
+
+Everything else goes through your normal Claude Code permission mode. Files you share on a call
+are saved outside your project folder, so in the default mode Claude's first look at one asks for
+your approval in Claude's window (the call page shows a banner); with
+`permissions.blockReadsOutsideWorkingDirectories` on, add the plugin data folder with `/add-dir`
+first. For hands-free work, a mode that auto-approves more is your choice to make; the plugin never
+changes it.
 
 ## Your OpenAI key
 

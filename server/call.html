@@ -125,7 +125,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
 .files { display: grid; gap: 12px; }
 .md + .files { margin-top: 4px; }
 .files figure { margin: 0; }
-.files img { display: block; width: 100%; max-height: 60vh; object-fit: contain; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; }
+/* Shrinks to fit, never grows: a small crop blown up to the card's width is only blurrier. */
+.files img { display: block; max-width: 100%; width: auto; height: auto; max-height: 60vh; object-fit: contain; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; }
 .files figcaption { margin-top: 4px; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
 .file-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--field); }
 .file-name { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
@@ -143,6 +144,13 @@ button.small { padding: 6px 10px; font-size: 14px; }
 #dropZone { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--overlay); pointer-events: none; }
 #dropZone p { margin: 0; padding: 22px 26px; border: 3px dashed var(--go); border-radius: 12px; background: var(--card); color: var(--text); font-size: 20px; font-weight: 600; text-align: center; }
 .offscreen { position: fixed; top: 0; left: -10000px; opacity: 0; }
+/* Read out by screen readers, not drawn. */
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+/* On a phone the typed box gets a row of its own, so its hint is not cut off by Attach and Send. */
+@media (max-width: 480px) {
+  #typeForm { flex-wrap: wrap; }
+  #typeForm #typed { flex-basis: 100%; }
+}
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -357,7 +365,13 @@ button.small { padding: 6px 10px; font-size: 14px; }
       if (m.state === "ended") {
         endSeen = true;
         if (phase === "live" || phase === "connecting") hangUp("Claude ended the call.");
-        else if (phase !== "ended") { phase = "ended"; setStatus("This call has ended.", (m.endReason || "") + " Run /talk in Claude to call again."); }
+        else if (phase !== "ended") {
+          // Nothing can be stopped or sent on an ended call: no Stop buttons, no chips.
+          phase = "ended";
+          setItems([]);
+          endAttachments();
+          setStatus("This call has ended.", (m.endReason || "") + " Run /talk in Claude to call again.");
+        }
       }
       render();
       return;
@@ -382,9 +396,9 @@ button.small { padding: 6px 10px; font-size: 14px; }
       return;
     }
     if (m.type === "say") { claudeResponded(); onSay(m); return; }
-    if (m.type === "attachments") { onAttachments(m.pending || []); return; }
+    if (m.type === "attachments") { onAttachments(m.pending || [], m.removed); return; }
     if (m.type === "cancelled") {
-      hidePerm();
+      hidePerm(true);
       // The Requests list still has it (the status frame follows this one), so it can say what went with it.
       var dropped = rows[m.id] ? rows[m.id].it : null;
       addLine("Call", m.was === "queued"
@@ -394,7 +408,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       return;
     }
     if (m.type === "instruct") {
-      hidePerm();
+      hidePerm(true);
       // Not speech: it changes how the voice behaves (listening mode) for the rest of the call.
       addLine("Call", "Claude told the voice: " + m.text, "note");
       if (m.mode === "listening") listening = true;
@@ -414,7 +428,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       addLine("Notice", m.text, "note");
       if (m.kind === "permission") {
         showPerm(m.text);
-        if (phase === "live") setStatus("Claude is waiting for your approval in its own window.", "The call cannot approve this. Switch to the Claude window to allow or deny it.");
+        if (phase === "live") setStatus(PERM_STATUS, "The call cannot approve this. Switch to the Claude window to allow or deny it.");
         commentary(null, "Tell the user this, briefly: " + m.text + ". The call cannot approve it; they have to switch to the Claude window.");
         return;
       }
@@ -735,7 +749,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
   /* A line's own post can land after the hang-up that follows it a moment later, and Claude's
      end-of-call hand-off goes out the instant the call ends. So the hang-up carries the last few
      seconds itself; the bridge keeps one copy of each line. */
-  var posted = [], lineSeq = 0;
+  var posted = [], lineSeq = 0, typedWaiting = { text: "", id: 0 };
   function post(role, t) {
     // Numbered, so the bridge knows a late post and its copy in the hang-up are one line.
     var id = ++lineSeq;
@@ -749,6 +763,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
       .map(function (p) { return { role: p.role, text: p.text, id: p.id }; });
     if (heardBuf.trim()) tail.push({ role: "user", text: heardBuf.trim(), id: ++lineSeq });
     if (saidBuf.trim()) tail.push({ role: "voice", text: saidBuf.trim(), id: ++lineSeq });
+    // A typed request still waiting for its upload never reached Claude: the hand-off carries it.
+    if (typedWaiting.text) tail.push({ role: "user", text: "(typed on the call page, never sent: the call ended while it waited for an upload) " + typedWaiting.text, id: typedWaiting.id });
     return tail.slice(-4);
   }
 
@@ -847,6 +863,10 @@ button.small { padding: 6px 10px; font-size: 14px; }
     clearTimeout(overhearTimer);
     claudeAsked = false;
     if (said.length) setStatus("Handing your request to Claude...", said.join(" "));
+    // "What is wrong in this?" said while its screenshot still uploads: the file goes with it.
+    await uploadsSettled();
+    // Ended while it waited: its lines are in the hang-up already, and the end-of-call hand-off has them.
+    if (phase === "ended") return;
     var r, j;
     try {
       r = await api("/delegate", { delegation_id: id, said: said, recent: recent.slice(-12), source: source });
@@ -1060,11 +1080,44 @@ button.small { padding: 6px 10px; font-size: 14px; }
     return e;
   }
 
-  // A Hebrew paragraph reads right to left, an English one left to right, in the same answer.
+  /* A Hebrew paragraph reads right to left, an English one left to right, in the same answer. The
+     direction is only noted here and set once the whole answer is built (see setDirs): an element
+     with dir=auto re-reads its text for every child added to it, which makes a long answer
+     quadratic. */
   function block(parent, tag) {
     var e = parent.appendChild(el(tag));
-    e.setAttribute("dir", "auto");
+    e.mdDir = /^(?:p|h\d)$/.test(tag) ? "auto" : "box";
     return e;
+  }
+
+  /* Paragraphs, headings and table cells read their own text (dir=auto). A list, quote or table
+     takes the direction of the first words inside it, so a Hebrew list has its bullets on the
+     right and a Hebrew table its first column there. (dir=auto on one of those would skip every
+     child that has a dir of its own, find no text, and always come out left to right.) Innermost
+     first, so no element is set before the ones inside it. */
+  var MD_LETTER = /\p{L}/u;
+  var MD_RTL = /[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}\p{Script=Samaritan}\p{Script=Mandaic}\p{Script=Adlam}]/u;
+
+  function firstDir(e) {
+    // Code blocks are always left to right; they say nothing about the language around them.
+    var w = document.createTreeWalker(e, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode: function (n) { return n.nodeName === "PRE" ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT; },
+    });
+    for (var n = w.nextNode(); n; n = w.nextNode()) {
+      var m = n.nodeType === 3 && MD_LETTER.exec(n.data);
+      if (m) return MD_RTL.test(m[0]) ? "rtl" : "ltr";
+    }
+    return "";
+  }
+
+  function setDirs(root) {
+    var all = root.querySelectorAll("*");
+    for (var k = all.length - 1; k >= 0; k--) {
+      var e = all[k];
+      if (!e.mdDir) continue;
+      var d = e.mdDir === "auto" ? "auto" : firstDir(e);
+      if (d) e.setAttribute("dir", d);   // no letters at all: it keeps the direction around it
+    }
   }
 
   function safeHref(u) {
@@ -1084,12 +1137,14 @@ button.small { padding: 6px 10px; font-size: 14px; }
     return a;
   }
 
+  /* No two runs of spaces sit next to each other in these patterns: a regular expression that can
+     split one long run of spaces between two of them takes quadratic time on it. */
   var MD_FENCE = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/;
-  var MD_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
+  var MD_HEADING = /^ {0,3}(#{1,6})(?=[ \t]|$)/;
   var MD_HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
   var MD_QUOTE = /^ {0,3}>[ \t]?(.*)$/;
   var MD_ITEM = /^( *)([-*+]|\d{1,9}[.)])(?:[ \t]+(.*)|$)/;
-  var MD_DELIM = /^ *\|? *:?-+:? *(?:\| *:?-+:? *)*\|? *$/;
+  var MD_DELIM = /^ *(?:\| *)?:?-+:?(?: *\| *:?-+:?)* *(?:\| *)?$/;
   var MD_ESC = /[!-\/:-@\[-`{-~]/;
   var MD_URL = /(?:https?:\/\/|mailto:)[^\s<]+/iy;
   var MD_AUTO = /<((?:https?:\/\/|mailto:)[^\s<>]+)>/iy;
@@ -1099,7 +1154,16 @@ button.small { padding: 6px 10px; font-size: 14px; }
   function renderMarkdown(src, files) {
     var root = el("div", "md");
     blocks(String(src).replace(/\r\n?/g, "\n").split("\n"), root, { files: files || [], inLink: false }, 0);
+    setDirs(root);
     return root;
+  }
+
+  // "## Title ##" -> "Title": the closing hashes go only when a space comes before them.
+  function headingText(line, m) {
+    var t = line.slice(m[0].length).trim(), k = t.length;
+    while (k > 0 && t[k - 1] === "#") k--;
+    if (k < t.length && (k === 0 || t[k - 1] === " " || t[k - 1] === "\t")) t = t.slice(0, k).trim();
+    return t;
   }
 
   function indentOf(l) { return /^ */.exec(l)[0].length; }
@@ -1118,7 +1182,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       if ((m = MD_FENCE.exec(line))) { i = fenced(lines, i, m, parent); continue; }
       if ((m = MD_HEADING.exec(line))) {
         // The card's own title is an h2, so markdown's levels start below it.
-        inline(m[2] || "", block(parent, "h" + Math.min(6, m[1].length + 2)), ctx, 0);
+        inline(headingText(line, m), block(parent, "h" + Math.min(6, m[1].length + 2)), ctx, 0);
         i++;
         continue;
       }
@@ -1150,7 +1214,10 @@ button.small { padding: 6px 10px; font-size: 14px; }
     var copy = bar.appendChild(el("button", "plain small", "Copy"));
     copy.type = "button";
     copy.setAttribute("aria-label", "Copy this " + (lang ? lang.slice(0, 40) + " " : "") + "code");
-    copy.addEventListener("click", function () { copyText(code, copy); });
+    // The button's label is fixed for screen readers, so the result is announced here instead.
+    var copied = bar.appendChild(el("span", "sr-only"));
+    copied.setAttribute("role", "status");
+    copy.addEventListener("click", function () { copyText(code, copy, copied); });
     var pre = box.appendChild(el("pre"));
     pre.setAttribute("dir", "ltr");        // code reads left to right, even inside a Hebrew answer
     pre.setAttribute("tabindex", "0");     // a long line scrolls sideways inside the box, by keyboard too
@@ -1262,7 +1329,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
 
   function cell(tag, text, align, ctx) {
     var c = el(tag);
-    c.setAttribute("dir", "auto");
+    c.mdDir = "auto";
     if (tag === "th") c.setAttribute("scope", "col");
     if (align) c.style.textAlign = align;
     inline(text, c, ctx, 0);
@@ -1354,13 +1421,16 @@ button.small { padding: 6px 10px; font-size: 14px; }
     return { text: s.slice(i + 1, j), url: url.replace(/\\(.)/g, "$1"), end: k + 1, raw: s.slice(i, k + 1) };
   }
 
-  // A URL's closing punctuation belongs to the sentence: "see https://x.com/a." links x.com/a.
+  /* A URL's closing punctuation belongs to the sentence: "see https://x.com/a." links x.com/a. A
+     closing bracket stays only while it closes one opened inside the URL. Counted once, not per
+     character trimmed, so a URL followed by a long run of brackets costs no more than its length. */
   function trimUrl(u) {
+    var open = u.split("(").length - 1, close = u.split(")").length - 1, end = u.length;
     for (;;) {
-      var last = u.slice(-1);
-      if (/[.,;:!?'"*_~]/.test(last)) u = u.slice(0, -1);
-      else if (last === ")" && u.split("(").length < u.split(")").length) u = u.slice(0, -1);
-      else return u;
+      var last = u.charAt(end - 1);
+      if (last && /[.,;:!?'"*_~]/.test(last)) end--;
+      else if (last === ")" && open < close) { end--; close--; }
+      else return u.slice(0, end);
     }
   }
 
@@ -1525,7 +1595,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
   function addShowButton(li, entry) {
     var b = li.appendChild(el("button", "plain small show", "Show on screen"));
     b.type = "button";
-    b.setAttribute("aria-label", "Show what Claude put on screen" + (entry.id ? " for " + entry.id : ""));
+    // Its spoken name starts with the words on it, so "click Show on screen" finds it by voice too.
+    b.setAttribute("aria-label", "Show on screen: what Claude showed" + (entry.id ? " for " + entry.id : ""));
     b.addEventListener("click", function () {
       for (var k = 0; k < screens.length; k++) {
         if (screens[k].n !== entry.n) continue;
@@ -1535,6 +1606,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       }
       b.disabled = true;
       b.textContent = "No longer kept (the card keeps the last 50)";
+      b.removeAttribute("aria-label");
     });
   }
 
@@ -1551,17 +1623,32 @@ button.small { padding: 6px 10px; font-size: 14px; }
         var img = a.appendChild(el("img"));
         img.setAttribute("src", url);
         img.setAttribute("alt", f.name);
-        var cap = fig.appendChild(el("figcaption", "", f.name + " · " + size));
-        cap.setAttribute("dir", "auto");
-        img.addEventListener("error", function () { cap.textContent = f.name + " · " + size + " · could not be loaded (the call may have ended)"; });
+        // The name in its own <bdi>, so a Hebrew name and the size keep their own order.
+        var cap = fig.appendChild(el("figcaption"));
+        var caption = function (more) {
+          cap.textContent = "";
+          cap.appendChild(el("bdi", "", f.name));
+          cap.appendChild(document.createTextNode(" · " + size + (more || "")));
+        };
+        caption();
+        img.addEventListener("error", function () { caption(" · could not be loaded (the call may have ended)"); });
         return;
       }
       var row = box.appendChild(el("div", "file-row"));
       row.appendChild(el("span", "file-name", f.name)).setAttribute("dir", "auto");
       row.appendChild(el("span", "file-size", "· " + size + " ·"));
-      var open = row.appendChild(outLink(url));
-      open.textContent = "Open";
-      open.setAttribute("aria-label", "Open " + f.name + " in a new tab");
+      // A browser shows pictures, PDFs and text; anything else it can only save, so say that.
+      var open;
+      if (f.download) {
+        open = row.appendChild(el("a", "", "Download"));
+        open.setAttribute("href", url);
+        open.setAttribute("download", f.name);
+        open.setAttribute("aria-label", "Download " + f.name);
+      } else {
+        open = row.appendChild(outLink(url));
+        open.textContent = "Open";
+        open.setAttribute("aria-label", "Open " + f.name + " in a new tab");
+      }
     });
     return box;
   }
@@ -1572,27 +1659,49 @@ button.small { padding: 6px 10px; font-size: 14px; }
      and waits on this computer until the user's next request, typed or spoken, takes it along.
      Names and contents never go to OpenAI: the voice only hears that files were attached. */
   var UPLOAD_MAX = 25 * 1024 * 1024, PENDING_MAX = 20;
-  var pending = [], uploads = [], removing = {}, gone = {}, waitingToSend = false;
+  var pending = [], uploads = [], removing = {}, gone = {}, waitingToSend = 0, upSeq = 0;
 
-  function chip(text, removeLabel, onRemove, cls) {
+  /* The file name sits in its own <bdi>: a Hebrew name next to a Latin size would otherwise pull the
+     size into the middle of it ("png · 21 B.צילום מסך"). */
+  function chip(parts, removeLabel, onRemove, cls, key) {
     var c = el("div", "chip" + (cls ? " " + cls : ""));
-    c.appendChild(el("span", "chip-text", text)).setAttribute("dir", "auto");
+    var t = c.appendChild(el("span", "chip-text"));
+    parts.forEach(function (p) { t.appendChild(typeof p === "string" ? document.createTextNode(p) : p); });
     var x = c.appendChild(el("button", "plain", "Remove"));
     x.type = "button";
     x.setAttribute("aria-label", removeLabel);
+    x.setAttribute("data-key", key);
     x.addEventListener("click", onRemove);
     return c;
   }
 
+  /* Redrawn on every upload step, so a keyboard user on a Remove keeps their place: the same chip's
+     button if it is still there, else the one that took its place, else Attach. */
   function renderAttach() {
-    var box = $("chips");
+    var box = $("chips"), a = document.activeElement;
+    var had = box.contains(a) && a.getAttribute("data-key");
+    var was = had ? [].map.call(box.querySelectorAll("button"), function (b) { return b.getAttribute("data-key"); }).indexOf(had) : -1;
     box.textContent = "";
     uploads.forEach(function (u) { box.appendChild(u.chip); });
     pending.forEach(function (p) {
-      box.appendChild(chip(p.name + " · " + human(p.size), "Remove " + p.name, function () { removeAttachment(p); }));
+      box.appendChild(chip([el("bdi", "", p.name), " · " + human(p.size)], "Remove " + p.name, function () { removeAttachment(p); }, "", "f" + p.id));
     });
     box.hidden = !uploads.length && !pending.length;
     noteAttach();
+    if (!had) return;
+    var btns = box.querySelectorAll("button"), same = null;
+    for (var k = 0; k < btns.length; k++) if (btns[k].getAttribute("data-key") === had) same = btns[k];
+    (same || btns[Math.min(was, btns.length - 1)] || $("attach")).focus();
+  }
+
+  /* Files still uploading belong to the request being sent now, typed, spoken or overheard: it
+     waits for them rather than going without them (and leaving them to ride with the next one). */
+  async function uploadsSettled() {
+    if (!uploads.length) return;
+    waitingToSend++;
+    noteAttach();
+    try { await Promise.all(uploads.map(function (u) { return u.done; })); }
+    finally { waitingToSend--; noteAttach(); }
   }
 
   function noteAttach() {
@@ -1647,8 +1756,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
      with no number for a big file looks frozen. */
   function startUpload(f, name, batch) {
     var x = new XMLHttpRequest();
-    var u = { name: name, pct: 0, quiet: false, xhr: x };
-    u.chip = chip("uploading " + name + " 0%", "Remove " + name, function () { x.abort(); }, "up");
+    var u = { name: name, pct: 0, quiet: false, xhr: x, pctText: el("span", "", "0") };
+    u.chip = chip(["uploading ", el("bdi", "", name), " ", u.pctText, "%"], "Remove " + name, function () { x.abort(); }, "up", "u" + (++upSeq));
     uploads.push(u);
     renderAttach();
     u.done = new Promise(function (resolve) {
@@ -1670,7 +1779,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       x.upload.addEventListener("progress", function (e) {
         if (!e.lengthComputable || !e.total) return;
         u.pct = Math.min(100, Math.floor(e.loaded / e.total * 100));
-        u.chip.firstChild.textContent = "uploading " + name + " " + u.pct + "%";
+        u.pctText.textContent = String(u.pct);
         noteAttach();
       });
       x.addEventListener("load", function () {
@@ -1706,16 +1815,23 @@ button.small { padding: 6px 10px; font-size: 14px; }
     }
   }
 
-  /* The bridge is the truth about what is waiting. A file that leaves the list without the user
-     removing it went to Claude with a request. */
-  function onAttachments(list) {
-    var now = {};
+  /* The bridge is the truth about what is waiting. A file that leaves the list without anyone
+     removing it (here, or in another tab of this call: the frame lists those) went to Claude with a
+     request. */
+  function onAttachments(list, removedIds) {
+    var now = {}, elsewhere = {};
     list.forEach(function (p) { if (p && p.id) now[p.id] = true; });
+    (Array.isArray(removedIds) ? removedIds : []).forEach(function (id) { elsewhere[id] = true; });
     var dropped = pending.filter(function (p) { return !now[p.id]; });
-    var shared = dropped.filter(function (p) { return !removing[p.id]; });
+    var shared = dropped.filter(function (p) { return !removing[p.id] && !elsewhere[p.id]; });
+    var there = dropped.filter(function (p) { return !removing[p.id] && elsewhere[p.id]; });
     dropped.forEach(function (p) { gone[p.id] = true; delete removing[p.id]; });
     pending = list.filter(function (p) { return p && p.id; });
     renderAttach();
+    if (there.length) {
+      addLine("Call", "removed " + there.map(function (p) { return p.name; }).join(", ") + " in another tab; Claude will not get "
+        + (there.length > 1 ? "them" : "it"), "note");
+    }
     if (!shared.length) return;
     var n = frameN, names = shared.map(function (p) { return p.name; }).join(", ");
     /* A request takes the files with it, and its working or status frame comes next. The bridge
@@ -1731,13 +1847,17 @@ button.small { padding: 6px 10px; font-size: 14px; }
   }
 
   function endAttachments() {
-    uploads.slice().forEach(function (u) { u.quiet = true; u.xhr.abort(); });
+    var cut = uploads.slice();
+    cut.forEach(function (u) { u.quiet = true; u.xhr.abort(); });
+    if (cut.length) {
+      addLine("Call", "the call ended before " + cut.map(function (u) { return u.name; }).join(", ")
+        + " finished uploading, so " + (cut.length > 1 ? "they were" : "it was") + " not shared", "note");
+    }
     if (pending.length) {
       addLine("Call", pending.length + " file(s) you attached did not go with a request: "
         + pending.map(function (p) { return p.name; }).join(", ") + ". Claude gets them in the end-of-call hand-off.", "note");
     }
     pending = [];
-    waitingToSend = false;
     renderAttach();
   }
 
@@ -1762,11 +1882,15 @@ button.small { padding: 6px 10px; font-size: 14px; }
   }
 
   function buildRows() {
-    var box = $("reqs");
+    var box = $("reqs"), a = document.activeElement;
+    // A keyboard user on a row keeps their place when the list is redrawn around it.
+    var had = box.contains(a) && a.getAttribute("data-req");
+    var was = had ? Object.keys(rows).indexOf(had) : -1;
     box.textContent = "";
     rows = {};
     items.forEach(function (it) {
       var li = box.appendChild(el("li", "req-" + it.state));
+      li.setAttribute("data-req", it.id);
       var top = li.appendChild(el("div", "req-top"));
       var label = top.appendChild(el("span", "req-label"));
       var head = label.appendChild(document.createTextNode(""));
@@ -1777,15 +1901,22 @@ button.small { padding: 6px 10px; font-size: 14px; }
         btn = top.appendChild(el("button", "stop small", "Stop"));
         btn.type = "button";
         btn.setAttribute("aria-label", "Stop request " + it.id);
+        btn.setAttribute("data-req", it.id);
         btn.disabled = true;
         btn.addEventListener("click", function () { stopRequest(it.id, btn); });
       }
-      rows[it.id] = { it: it, head: head, btn: btn };
+      rows[it.id] = { it: it, head: head, btn: btn, li: li };
     });
     box.hidden = !items.length;
+    /* Its Stop is dead for a moment and cannot hold focus, so the row does, and hands it back to
+       Stop once it works again. A row that is gone passes focus to the one that took its place. */
+    var back = had && (rows[had] || rows[(items[Math.min(was, items.length - 1)] || {}).id]);
+    if (back) { back.li.tabIndex = -1; back.li.focus(); }
     clearTimeout(stopArm);
     stopArm = setTimeout(function () {
       for (var id in rows) if (rows[id].btn && !stopBusy[id]) rows[id].btn.disabled = false;
+      var f = document.activeElement, r = f && f.tagName === "LI" && box.contains(f) && rows[f.getAttribute("data-req")];
+      if (r && r.btn && !r.btn.disabled) r.btn.focus();
     }, 700);
   }
 
@@ -1833,19 +1964,25 @@ button.small { padding: 6px 10px; font-size: 14px; }
 
   /* Claude Code's own permission prompt stalls the work, and a plugin cannot answer it. The call
      can only say so, loudly, until Claude moves again (its next say or notice). */
-  var permTimer = null;
+  var permTimer = null, PERM_STATUS = "Claude is waiting for your approval in its own window.";
 
   function showPerm(t) {
     $("permText").textContent = t;
     $("permBox").hidden = false;
     clearTimeout(permTimer);
-    permTimer = setTimeout(hidePerm, 10 * 60000);
+    permTimer = setTimeout(function () { hidePerm(true); }, 10 * 60000);
     $("permBox").scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 
-  function hidePerm() {
+  /* resetStatus: Claude moved without saying anything (an instruction, a stop, ten quiet minutes),
+     so a status line still claiming it waits for approval is stale; say what is true now. A say or
+     working frame sets its own status right after. */
+  function hidePerm(resetStatus) {
     clearTimeout(permTimer);
     $("permBox").hidden = true;
+    if (resetStatus !== true || phase !== "live" || $("status").textContent !== PERM_STATUS) return;
+    if (claude.claude === "working") setStatus("Claude is working.", claude.on || "");
+    else setStatus("Listening.", "Talk whenever you are ready.");
   }
 
   /* ------------------------------------------------------------ wiring -- */
@@ -1904,6 +2041,10 @@ button.small { padding: 6px 10px; font-size: 14px; }
     var files = [].slice.call(dt.files || []);
     if (!files.length) [].forEach.call(dt.items || [], function (it) { var f = it.kind === "file" && it.getAsFile(); if (f) files.push(f); });
     if (!files.length) return;
+    /* Excel, Word and OneNote put a picture of what was copied next to its text. Pasted into a text
+       box, that means the text. */
+    var t = e.target, typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    if (typing && [].indexOf.call(dt.types || [], "text/plain") >= 0 && (dt.getData("text/plain") || "").trim()) return;
     e.preventDefault();
     uploadFiles(files, "paste");
   });
@@ -1941,13 +2082,18 @@ button.small { padding: 6px 10px; font-size: 14px; }
     $("typed").value = "";
     try {
       if (uploads.length) {
-        waitingToSend = true;
-        noteAttach();
-        await Promise.all(uploads.map(function (u) { return u.done; }));
-        waitingToSend = false;
-        noteAttach();
+        if (t) typedWaiting = { text: t, id: ++lineSeq };
+        await uploadsSettled();
+        typedWaiting = { text: "", id: 0 };
       }
-      if (phase === "ended") return;
+      if (phase === "ended") {
+        // The call ended while it waited: not sent, and not lost either (the hang-up carried it).
+        if (t) {
+          if (!$("typed").value) $("typed").value = t;
+          addLine("Call", "not sent, the call ended first: " + t, "note");
+        }
+        return;
+      }
       if (!t && !pending.length) { addLine("Error", "Nothing was sent: the upload did not finish, so there was no file and no message.", "err"); return; }
       addLine("You (typed)", t || "(no message: sending the file(s) you attached)", "you");
       var r = await api("/typed", { text: t });
@@ -1959,7 +2105,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       addLine("Error", "Claude did not get that: " + String((err && err.message) || err), "err");
     } finally {
       sendingTyped = false;
-      waitingToSend = false;
+      typedWaiting = { text: "", id: 0 };
     }
   });
 
@@ -1968,6 +2114,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
   connectEvents();
   if (CFG.state === "ended") {
     phase = "ended";
+    setItems([]);
     render();
     setStatus("This call has ended.", (CFG.endReason || "") + " Run /talk in Claude to call again.");
   } else if (!CFG.keyPresent) {

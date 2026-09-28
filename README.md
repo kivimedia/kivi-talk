@@ -48,11 +48,15 @@ already open? That window keeps its old command list: type `/reload-plugins` in 
 - For longer work you hear short progress notes. You can keep talking; new requests queue.
 - Claude shows you things, not just says them. Code, commands, file paths, links, tables, exact
   error text, screenshots and files appear on the call page's **On screen** card, with a Copy
-  button for text and an Open link for files. Claude says the short version out loud and tells
-  you the rest is on screen. Earlier entries stay one click away (Previous / Next).
+  button for text. Pictures show on the card; PDFs and text files open in a new tab; anything
+  else (Office files, archives, audio, video) is a Download link. Claude says the short version
+  out loud and tells you the rest is on screen. Earlier entries stay one click away (Previous /
+  Next).
 - Show Claude things too: press **Attach**, drag files onto the page, or paste a screenshot. They
   go to Claude with your next request, typed or spoken, and Claude opens them with its own tools.
-  Files alone are fine: press Send with an empty box.
+  Files alone are fine: press Send with an empty box. They are saved outside your project folder,
+  so in Claude Code's default permission mode Claude's first look at one asks for your approval in
+  its window (you hear a heads-up and the call page shows a banner).
 - Stop a request: press **Stop** next to it in the list of open requests, or just say "stop" or
   "cancel" (Hebrew works too: "עצור", "בטל"). A request still waiting in the queue is dropped. One
   Claude is already working on stops at Claude's next check-in (its next progress note), and
@@ -84,8 +88,8 @@ already open? That window keeps its old command list: type `/reload-plugins` in 
                      └──── answer spoken ◄── commentary ◄── call_say ◄──────────┘
 ```
 
-- The plugin's MCP server starts a small web server on `127.0.0.1` only, with a random port and
-  a random per-call token in every URL.
+- The plugin's MCP server starts a small web server on `127.0.0.1` only, on a random port. The
+  call page opens through a one-time link and then holds a per-call secret in a cookie.
 - Your OpenAI key never reaches the page. The page sends its WebRTC offer to the local server,
   which opens the session with OpenAI and hands back only the answer.
 - Claude only learns what you said through the `call_next` tool, as a request it handles like a
@@ -116,7 +120,8 @@ heads-up, the call page shows a banner, and you approve or deny it in Claude's w
 What never leaves your computer: the **On screen** card (code, links, tables, anything Claude
 shows you), files in both directions (what Claude shares with you and what you share with
 Claude), and their file names. The voice model only hears that there is something on screen or
-that you attached files, and on-screen content is not written to call transcripts either. Files you share are saved in the plugin's data folder under
+that you attached files, and on-screen content is not written to call transcripts either. Files
+you share are saved in the plugin's data folder under
 `uploads/<call id>/`, readable only by you (owner-only permissions on macOS and Linux), kept after
 the call so Claude can finish working with them, and deleted automatically after 7 days (at the
 start of a later call). What still goes to OpenAI: your speech, Claude's spoken answers, and the
