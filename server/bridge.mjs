@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.6.1";
+export const VERSION = "0.6.2";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -690,6 +690,9 @@ function sendNote(res, status, title, body) {
     + `<h1 style="font-size:22px">${esc(title)}</h1><p>${esc(body)}</p></body>`);
 }
 
+const CALL_ENDED_NOTE = ["This call has ended",
+  "To talk again, type /talk in Claude. If a new call has already started, its page opened in a tab of its own."];
+
 /* Every request passes these gates before it is routed:
  *   1. Host must be this port on a loopback name. A DNS-rebinding page arrives with its own
  *      hostname in Host, so it stops here.
@@ -739,8 +742,25 @@ export async function handle(req, res) {
   }
 
   const m = url.pathname.match(/^\/c\/([a-f0-9]{12})(\/.*)?$/);
-  if (!m || !call || m[1] !== call.id) return sendJson(res, 404, { error: "no such call" });
+  if (!m) {
+    /* A person can land anywhere on this port: the call link cut down to the bare port in chat, a
+       launch code cut short, a typed address. A browser must get a page, never raw JSON. While a
+       call is open it goes to that call's page, which still needs the cookie: the browser that
+       opened the call has it and gets the call, any other gets the note on how to open it. Only a
+       GET is a person; everything else keeps its JSON. */
+    if (req.method === "GET") {
+      if (call && isOpen(call)) { res.writeHead(302, { ...SECURITY_HEADERS, location: `/c/${call.id}/` }); return res.end(); }
+      return sendNote(res, 404, "No call is open right now", "Type /talk in Claude to start one.");
+    }
+    return sendJson(res, 404, { error: "no such call" });
+  }
   const sub = m[2] || "";
+  if (!call || m[1] !== call.id) {
+    /* The address of an earlier call: a tab reloaded after its call ended and Claude started
+       another, or after the session restarted. The page itself says so; its API paths keep JSON. */
+    if (req.method === "GET" && (sub === "" || sub === "/")) return sendNote(res, 404, ...CALL_ENDED_NOTE);
+    return sendJson(res, 404, { error: "no such call" });
+  }
   const c = call;
   if (req.method === "GET" && sub === "") { res.writeHead(302, { ...SECURITY_HEADERS, location: `/c/${c.id}/` }); return res.end(); }
 
@@ -748,6 +768,8 @@ export async function handle(req, res) {
   const byHook = !origin && tokenOk(req.headers["x-ttc-hook"], c.hookToken) && (sub === "/status" || sub === "/notify");
   if (!byPage && !byHook) {
     if (req.method === "GET" && sub === "/") {
+      // Asking Claude for a fresh link to an ended call would only start a new one: say it is over.
+      if (!isOpen(c)) return sendNote(res, 410, ...CALL_ENDED_NOTE);
       return sendNote(res, 403, "Open the call from Claude",
         "This page only opens through the one-time link Claude gives you. Ask Claude to open the call page again.");
     }
@@ -1566,6 +1588,31 @@ function untoldStops(c) {
   return lines.join("\n");
 }
 
+/* Call 29-Sep-2026: the browser had already opened the page, spending the one-time link, and Claude
+   still showed the user the link, cut down to the bare port; the user followed that instead of the
+   tab. So when the browser opened, the tab is the call and the link is not for the user. It stays
+   in the text for the one case where no tab appeared, and then it still works, because nothing used
+   it. Without a browser the link goes to the user whole: cut short it opens nothing, and it is safe
+   to show because it dies on first use. */
+export function callStartText({ url, opened, reopen = false, state = "", key = { key: "" }, port: p, id }) {
+  return [
+    reopen ? `The call was already open (${state}); a fresh one-time link to its page was made.` : "",
+    ...(opened ? [
+      `The call page opened in the user's browser, in a tab titled "Kivi Talk". That tab is the call.`,
+      "Tell the user in one short line to switch to the Kivi Talk tab and press Start talking. Do not paste, shorten or retype the link in chat: it works only once, and the browser already used it.",
+      `Only if the user says no Kivi Talk tab appeared, give them this link exactly as written, all of it: ${url}`,
+    ] : [
+      `Kivi Talk could not open the browser. In one short line, give the user this one-time link exactly as written, all of it, and tell them to press Start talking on the page it opens: ${url}`,
+      "It is safe to show (it stops working once opened), and cut short it does not open the call.",
+    ]),
+    key.key
+      ? `OpenAI key: ${key.source} (${keyHint(key.key)}).`
+      : "No OpenAI key is set yet: the call page will ask for one (it is stored only on this computer).",
+    "After that, call call_next and keep looping on it.",
+    `[ttc-bridge] port=${p} call=${id}`,
+  ].filter(Boolean).join("\n");
+}
+
 async function runTool(name, args, ctx) {
   args = args || {};
   if (name === "call_start") {
@@ -1588,16 +1635,7 @@ async function runTool(name, args, ctx) {
     const url = launchUrl(c);
     const opened = openBrowser(url);
     if (ENV.TTC_URL_FILE) { try { fs.writeFileSync(ENV.TTC_URL_FILE, url); } catch {} }
-    const k = resolveKey();
-    return text([
-      reopen ? `The call was already open (${c.state}); here is a fresh link to its page.` : "",
-      opened ? `Call page opened in the browser (one-time link): ${url}` : `Open this one-time link in a browser: ${url}`,
-      k.key
-        ? `OpenAI key: ${k.source} (${keyHint(k.key)}).`
-        : "No OpenAI key is set yet: the call page will ask for one (it is stored only on this computer).",
-      "Tell the user in one short line to press Start talking on that page. Then call call_next and keep looping on it.",
-      `[ttc-bridge] port=${port} call=${c.id}`,
-    ].filter(Boolean).join("\n"));
+    return text(callStartText({ url, opened, reopen, state: c.state, key: resolveKey(), port, id: c.id }));
   }
 
   if (name === "call_confirm") {

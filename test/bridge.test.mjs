@@ -366,7 +366,9 @@ test("HTTP gates: host, cookie, origin, content type, method", async () => {
     assert.equal((await post(page.base + "typed", { text: "rm -rf" })).status, 403);
     assert.equal((await fetch(page.base + "events")).status, 403);
     assert.equal((await fetch(`http://127.0.0.1:${port}/c/000000000000/`, { headers: { cookie: page.cookie } })).status, 404);
-    assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 404);
+    // The bare root only points at the call's page, which still wants the cookie.
+    assert.equal((await fetch(`http://127.0.0.1:${port}/`, { redirect: "manual" })).status, 302);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 403);
     // Cookie, but a cross-site Origin (SameSite would normally stop the cookie; this is the belt).
     assert.equal((await page.post("typed", { text: "rm -rf" }, { origin: "https://attacker.example" })).status, 403);
     const form = await fetch(page.base + "typed", { method: "POST", headers: { cookie: page.cookie, "content-type": "application/x-www-form-urlencoded" }, body: "text=hi" });
@@ -1608,5 +1610,112 @@ test("an empty hand-over right after a Stop does not attach to the stopped reque
     const r = await page.post("delegate", { delegation_id: "d9", said: [], recent: [] });
     assert.notEqual(r.json && r.json.id, "r1", JSON.stringify(r.json));
     assert.equal(r.status, 400);
+  } finally { b.stop(); }
+});
+
+/* Live 29-Sep-2026: Claude pasted the call link cut down to http://127.0.0.1:<port>/, the browser
+   showed {"error":"no such call"}, and the real page sat unstarted in its own tab until the call
+   timed out. A person can land anywhere on the port; a browser must always get a page. */
+test("0.6.2: the bare root, or any other address a person lands on, goes to the open call's page, never raw JSON", async () => {
+  const { b, page } = await started();
+  try {
+    const u = new URL(page.base), root = u.origin + "/";
+    for (const p of ["/", "/launch/cut-short", "/index.html", "/c/"]) {
+      const r = await fetch(u.origin + p, { redirect: "manual" });
+      assert.equal(r.status, 302, p);
+      assert.equal(r.headers.get("location"), u.pathname, p);
+    }
+    // The browser that opened the call holds its cookie, so the bare root lands on the call itself.
+    const mine = await fetch(root, { headers: { cookie: page.cookie } });
+    assert.equal(mine.status, 200);
+    assert.equal(mine.url, page.base);
+    assert.match(await mine.text(), /<title>Kivi Talk<\/title>/);
+    // Any other browser gets the note that says how to open the call.
+    const other = await fetch(root);
+    assert.equal(other.status, 403);
+    assert.match(other.headers.get("content-type"), /^text\/html/);
+    assert.match(await other.text(), /Open the call from Claude/);
+    // Anything that is not a person's GET keeps its JSON.
+    const api = await post(root, { x: 1 });
+    assert.equal(api.status, 404);
+    assert.deepEqual(api.json, { error: "no such call" });
+    // Once the call is over there is nowhere to send the browser: a note says how to start one.
+    await page.post("state", { state: "closed", reason: "bye" });
+    for (const p of ["/", "/launch/cut-short"]) {
+      const none = await fetch(u.origin + p, { redirect: "manual" });
+      assert.equal(none.status, 404, p);
+      assert.match(none.headers.get("content-type"), /^text\/html/, p);
+      const html = await none.text();
+      assert.match(html, /No call is open right now/, p);
+      assert.match(html, /Type \/talk in Claude/, p);
+      assert.doesNotMatch(html, /no such call/, p);
+    }
+  } finally { b.stop(); }
+});
+
+test("0.6.2: the page address of an ended or unknown call says the call has ended; its API paths keep JSON", async () => {
+  const { b, page } = await started();
+  try {
+    const u = new URL(page.base);
+    const unknown = `${u.origin}/c/000000000000/`;
+    for (const [addr, h] of [[unknown, {}], [unknown, { cookie: page.cookie }], [unknown.slice(0, -1), {}]]) {
+      const r = await fetch(addr, { headers: h, redirect: "manual" });
+      assert.equal(r.status, 404, addr);
+      assert.match(r.headers.get("content-type"), /^text\/html/, addr);
+      const html = await r.text();
+      assert.match(html, /This call has ended/, addr);
+      assert.match(html, /\/talk/, addr);
+    }
+    const api = await fetch(unknown + "status");
+    assert.equal(api.status, 404);
+    assert.deepEqual(await api.json(), { error: "no such call" });
+    // The call ends: a browser without its cookie is told so; the tab that held it loads its own ended page.
+    await page.post("state", { state: "closed", reason: "bye" });
+    const ended = await fetch(page.base);
+    assert.equal(ended.status, 410);
+    assert.match(ended.headers.get("content-type"), /^text\/html/);
+    assert.match(await ended.text(), /This call has ended/);
+    assert.equal((await page.get("")).status, 200);
+    // A new call replaces it: reloading the old tab gets the note, not JSON.
+    await b.tool("call_start", {});
+    const stale = await fetch(page.base, { headers: { cookie: page.cookie } });
+    assert.equal(stale.status, 404);
+    assert.match(stale.headers.get("content-type"), /^text\/html/);
+    assert.match(await stale.text(), /This call has ended/);
+  } finally { b.stop(); }
+});
+
+/* The page opened itself in the browser, which spent the one-time link. Claude still showed the
+   link, cut short, and the user followed that instead of the tab. */
+test("0.6.2: call_start points to the Kivi Talk tab when the browser opened it, and hands out the whole link only when it did not", async () => {
+  const t = bridgeMod.callStartText;
+  assert.equal(typeof t, "function", "call_start's text is built by callStartText");
+  const url = "http://127.0.0.1:59892/launch/" + "Ab3_".repeat(8);
+  const base = { url, port: 59892, id: "abcdefabcdef", key: { key: KEY, source: "plugin setting" } };
+  const opened = t({ ...base, opened: true });
+  assert.match(opened, /tab titled "Kivi Talk"/);
+  assert.match(opened, /Do not paste, shorten or retype the link in chat/);
+  assert.match(opened, /works only once/);
+  assert.doesNotMatch(opened, /Open this one-time link/);
+  assert.doesNotMatch(opened, /http:\/\/127\.0\.0\.1:59892\/?(\s|$)/, "never a bare host:port");
+  assert.match(opened, /\[ttc-bridge\] port=59892 call=abcdefabcdef/);
+  assert.match(opened, /OpenAI key: plugin setting \(ends in WXYZ\)\./);
+  const notOpened = t({ ...base, opened: false });
+  assert.match(notOpened, /could not open the browser/);
+  assert.ok(notOpened.includes(url), "the whole link, code and all");
+  assert.match(notOpened, /exactly as written/);
+  assert.doesNotMatch(notOpened, /tab titled/);
+  assert.match(notOpened, /\[ttc-bridge\] port=59892 call=abcdefabcdef/);
+  assert.match(t({ ...base, opened: true, reopen: true, state: "live" }), /already open \(live\)/);
+});
+
+test("0.6.2: with no browser, the real call_start result carries the whole link and says to pass it on exactly as written", async () => {
+  const b = startBridge();
+  try {
+    await b.init();
+    const out = await b.tool("call_start", {});
+    assert.ok(out.includes(b.launchUrl()), "the whole link, code and all");
+    assert.match(out, /exactly as written/);
+    assert.doesNotMatch(out, /tab titled "Kivi Talk"/, "no tab was opened, so none is claimed");
   } finally { b.stop(); }
 });
