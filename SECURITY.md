@@ -82,6 +82,36 @@ Stored by Claude Code's plugin settings (system secure storage where available),
 it on the call page, in `config.json` in the plugin's data folder (readable only by you on macOS
 and Linux). Use a key with a spending limit. Never paste a key into a GitHub issue.
 
+## For plugin directory reviewers
+
+The automated scan raises these on Kivi Talk. Each is expected; here is exactly what the code does.
+
+- **A hook grants permission.** `hooks/hooks.json` has one PreToolUse hook that approves only
+  this plugin's own seven tools, by an anchored name match
+  (`^mcp__plugin_kivi-talk_voice__call_(start|next|say|instruct|confirm|end|status)$`), and
+  `hooks/guard.mjs` checks the exact name a second time. No other tool is ever approved, including
+  one from another server whose name merely contains ours (`test/guard.test.mjs` proves both).
+  Without it, a voice call would stop for an on-screen prompt every time Claude goes back to
+  listening. These tools cannot run commands or change files (see Permissions above).
+- **The plugin uses a credential from your machine.** The only credential is the user's own
+  OpenAI API key, from, in order: a key the user pasted on the local call page (checked with
+  OpenAI first, then saved in the plugin data folder), the plugin's `sensitive` userConfig value,
+  or an `OPENAI_API_KEY` environment variable. It is sent only in the `Authorization` header to
+  the key's own issuer, `https://api.openai.com`, for exactly two requests: `GET /v1/models/<model>`
+  (to check a pasted key) and `POST /v1/live/sessions` (to open the user's voice session). It is
+  never sent to the call page, never logged, and removed from the environment of the one process
+  the plugin starts. `TTC_OPENAI_BASE` changes that host only so the tests can use a local mock.
+  The flagged test files use fake keys, except `test/e2e/run.mjs` and `test/e2e/leftovers.mjs`,
+  which a developer runs by hand with a real key in `TTC_E2E_OPENAI_KEY`; they are not part of
+  the plugin's behaviour.
+- **A download-and-run pattern.** Nothing is downloaded and run. The one process the plugin starts
+  is the operating system's own link opener (`rundll32 url.dll`, `open`, `xdg-open`, or
+  `cmd /c start` under WSL) pointed at the bridge's own one-time `http://127.0.0.1` link, so the
+  call page opens in the user's browser. The test helpers start the local bridge and a local
+  headless Chrome. The hooks make requests to `127.0.0.1` only.
+- **The MCP server is local.** It is a zero-dependency Node script that runs on the user's
+  computer, so the plugin works in Claude Code only, not in Cowork or the Claude apps.
+
 ## Reporting a problem
 
 Use GitHub's private vulnerability reporting on this repository (Security tab, "Report a
