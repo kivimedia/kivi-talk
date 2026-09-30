@@ -330,7 +330,7 @@ test("call_start never prints a reusable secret: only a one-time link and the po
   } finally { b.stop(); }
 });
 
-test("the launch link works once, sets a locked-down cookie, and a second use is refused", async () => {
+test("the launch link works once, sets a locked-down cookie, and a second use grants nothing", async () => {
   const b = startBridge();
   try {
     await b.init();
@@ -342,7 +342,10 @@ test("the launch link works once, sets a locked-down cookie, and a second use is
     assert.match(page.setCookie, /Path=\/c\/[a-f0-9]{12}\//);
     assert.equal((await page.get("")).status, 200);
     const again = await fetch(link, { redirect: "manual" });
-    assert.equal(again.status, 410, "a spent link is dead");
+    // A spent link only points at the call page, which still wants the cookie (0.6.3).
+    assert.equal(again.status, 302);
+    assert.equal(again.headers.get("set-cookie"), null, "a spent link sets no cookie");
+    assert.equal((await fetch(link)).status, 403, "followed without the cookie, it opens nothing");
     // Its own browser, holding the cookie, is simply sent back to the page.
     const mine = await fetch(link, { redirect: "manual", headers: { cookie: page.cookie } });
     assert.equal(mine.status, 302);
@@ -783,11 +786,12 @@ test("one voice session per call: a second /live is refused until the first is a
   const oa = await mockOpenAI();
   const { b, page } = await started({ TTC_OPENAI_BASE: oa.base, TTC_OPENAI_API_KEY: KEY });
   try {
-    assert.equal((await page.post("live", { sdp: "v=0 a" })).status, 200);
+    const first = await page.post("live", { sdp: "v=0 a" });
+    assert.equal(first.status, 200);
     const second = await page.post("live", { sdp: "v=0 b" });
     assert.equal(second.status, 409);
     assert.match(second.json.error, /already connected/);
-    await page.post("state", { state: "reset" });              // the page cancelled its attempt
+    await page.post("state", { state: "reset", attempt: first.json.attempt });   // the page cancelled its own attempt
     assert.equal((await page.post("live", { sdp: "v=0 c" })).status, 200);
     await page.post("state", { state: "live" });
     assert.equal((await page.post("live", { sdp: "v=0 d" })).status, 409);
@@ -1694,8 +1698,6 @@ test("0.6.2: call_start points to the Kivi Talk tab when the browser opened it, 
   const base = { url, port: 59892, id: "abcdefabcdef", key: { key: KEY, source: "plugin setting" } };
   const opened = t({ ...base, opened: true });
   assert.match(opened, /tab titled "Kivi Talk"/);
-  assert.match(opened, /Do not paste, shorten or retype the link in chat/);
-  assert.match(opened, /works only once/);
   assert.doesNotMatch(opened, /Open this one-time link/);
   assert.doesNotMatch(opened, /http:\/\/127\.0\.0\.1:59892\/?(\s|$)/, "never a bare host:port");
   assert.match(opened, /\[ttc-bridge\] port=59892 call=abcdefabcdef/);
@@ -1718,4 +1720,75 @@ test("0.6.2: with no browser, the real call_start result carries the whole link 
     assert.match(out, /exactly as written/);
     assert.doesNotMatch(out, /tab titled "Kivi Talk"/, "no tab was opened, so none is claimed");
   } finally { b.stop(); }
+});
+
+/* Live 29-Sep-2026, second time: the browser opened the call by itself (spending the code, setting
+   the cookie), Claude pasted the full link as a fallback, and the same Chrome answered it with
+   "This call link was already used" while the live page sat one tab away. The cookie decides who
+   gets the call; a spent or wrong code only points at it. */
+test("0.6.3: a spent or wrong launch code goes to the open call's page; the cookie still decides", async () => {
+  const { b, page } = await started();
+  try {
+    const spent = b.launchUrl();
+    const wrong = new URL(spent).origin + "/launch/" + "Z".repeat(32);
+    for (const link of [spent, wrong]) {
+      const r = await fetch(link, { redirect: "manual" });
+      assert.equal(r.status, 302, link);
+      assert.equal(r.headers.get("location"), new URL(page.base).pathname, link);
+      assert.equal(r.headers.get("set-cookie"), null, "no cookie from a code that is not live");
+    }
+    // The browser that opened the call lands on it (a real browser sends the cookie on the redirect).
+    const mine = await fetch(spent, { headers: { cookie: page.cookie } });
+    assert.equal(mine.status, 200);
+    assert.equal(mine.url, page.base);
+    const other = await fetch(spent);
+    assert.equal(other.status, 403);
+    assert.match(await other.text(), /Open the call from Claude/);
+    assert.equal((await page.get("")).status, 200, "a spent code rotates nothing: the page keeps its cookie");
+    // Once the call is over, the link says so, as a page.
+    await page.post("state", { state: "closed", reason: "bye" });
+    const ended = await fetch(spent, { redirect: "manual" });
+    assert.equal(ended.status, 410);
+    assert.match(ended.headers.get("content-type"), /^text\/html/);
+    const html = await ended.text();
+    assert.match(html, /This call has ended/);
+    assert.match(html, /\/talk/);
+    assert.doesNotMatch(html, /"error"/);
+  } finally { b.stop(); }
+});
+
+test("0.6.3: when the browser opened the call, the one link to show is the page itself, never the spent code", () => {
+  const t = bridgeMod.callStartText;
+  const url = "http://127.0.0.1:59892/launch/" + "Ab3_".repeat(8);
+  const base = { url, port: 59892, id: "abcdefabcdef", key: { key: KEY, source: "plugin setting" } };
+  const opened = t({ ...base, opened: true });
+  assert.match(opened, /tab titled "Kivi Talk"/);
+  assert.ok(opened.includes("http://127.0.0.1:59892/c/abcdefabcdef/"), "the page link, which holds no code");
+  assert.doesNotMatch(opened, /\/launch\//, "the spent code is not in the text at all");
+  assert.doesNotMatch(opened, /Do not paste/, "nothing that makes the link look like something to hold back");
+  assert.match(opened, /\[ttc-bridge\] port=59892 call=abcdefabcdef/);
+  assert.match(opened, /OpenAI key: plugin setting \(ends in WXYZ\)\./);
+  const notOpened = t({ ...base, opened: false });
+  assert.ok(notOpened.includes(url), "without a browser the one-time link is the only way in");
+  assert.match(notOpened, /exactly as written/);
+  assert.doesNotMatch(notOpened, /\/c\/abcdefabcdef\//);
+});
+
+/* Two tabs of one call are normal now (the one the browser opened, the one the user clicked). A
+   tab whose Start was refused because the other tab is connecting used to post "reset", which
+   wiped the other tab's attempt, so the next Start opened a second paid voice session. */
+test("0.6.3: a tab refused because another tab is connecting cannot cancel that tab's attempt", async () => {
+  const oa = await mockOpenAI();
+  const { b, page } = await started({ TTC_OPENAI_BASE: oa.base, TTC_OPENAI_API_KEY: KEY });
+  try {
+    const mine = await page.post("live", { sdp: "v=0 tab B" });
+    assert.equal(mine.status, 200);
+    assert.equal((await page.post("live", { sdp: "v=0 tab A" })).status, 409);
+    await page.post("state", { state: "reset" });                          // tab A gives up, as its catch does
+    await page.post("state", { state: "reset", attempt: "not-its-own" });
+    assert.equal(JSON.parse(await b.tool("call_status")).state, "connecting", "tab B's attempt stands");
+    await page.post("state", { state: "live" });                           // tab B's voice starts
+    assert.equal((await page.post("live", { sdp: "v=0 tab A again" })).status, 409);
+    assert.equal(oa.seen.filter((s) => s.url === "/v1/live/sessions").length, 1, "one paid voice session, ever");
+  } finally { b.stop(); oa.close(); }
 });

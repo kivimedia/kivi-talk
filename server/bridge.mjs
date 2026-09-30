@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.6.2";
+export const VERSION = "0.6.3";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -163,7 +163,7 @@ function newCall(focus) {
     pendingHanded: new Map(),   // normalised user line -> hand-overs that arrived before the line itself
     lineIds: new Set(),         // page line ids already recorded, so the hang-up tail and a late post are one line
     tailKeys: new Set(),        // the same for pages that send no ids: by text
-    liveId: null, usage: null,
+    liveId: null, liveAttempt: null, usage: null,
     timers: new Set(),
     logFile: "",
     shared: new Map(),          // file token -> { path, name, type, size }: files Claude put on screen
@@ -692,6 +692,7 @@ function sendNote(res, status, title, body) {
 
 const CALL_ENDED_NOTE = ["This call has ended",
   "To talk again, type /talk in Claude. If a new call has already started, its page opened in a tab of its own."];
+const NO_CALL_NOTE = ["No call is open right now", "Type /talk in Claude to start one."];
 
 /* Every request passes these gates before it is routed:
  *   1. Host must be this port on a loopback name. A DNS-rebinding page arrives with its own
@@ -737,8 +738,12 @@ export async function handle(req, res) {
       });
       return res.end();
     }
-    return sendNote(res, 410, "This call link was already used",
-      "Each link opens the call page once. If your call is open in another tab, use that tab. Otherwise ask Claude to open the call page again.");
+    /* A spent or wrong code, most often the link the browser already opened, clicked again from
+       the chat in that same browser. It only points at the call, like the bare root does: the
+       browser holding the cookie gets the call, any other gets the note on how to open it. No
+       cookie is set and no secret rotates here, so it grants nothing. */
+    if (c && isOpen(c)) { res.writeHead(302, { ...SECURITY_HEADERS, location: `/c/${c.id}/` }); return res.end(); }
+    return c ? sendNote(res, 410, ...CALL_ENDED_NOTE) : sendNote(res, 404, ...NO_CALL_NOTE);
   }
 
   const m = url.pathname.match(/^\/c\/([a-f0-9]{12})(\/.*)?$/);
@@ -750,7 +755,7 @@ export async function handle(req, res) {
        GET is a person; everything else keeps its JSON. */
     if (req.method === "GET") {
       if (call && isOpen(call)) { res.writeHead(302, { ...SECURITY_HEADERS, location: `/c/${call.id}/` }); return res.end(); }
-      return sendNote(res, 404, "No call is open right now", "Type /talk in Claude to start one.");
+      return sendNote(res, 404, ...NO_CALL_NOTE);
     }
     return sendJson(res, 404, { error: "no such call" });
   }
@@ -928,7 +933,7 @@ async function postLive(res, c, body) {
   /* One voice session per call. A second tab (or a double click) opening another would bill
      twice and hand every request to Claude twice. A connect attempt older than the page's own
      20-second timeout is dead and may be replaced. */
-  if (c.liveId && (c.state === "live" || (c.state === "connecting" && Date.now() - (c.liveTriedAt || 0) < 25000))) {
+  if (c.liveAttempt && (c.state === "live" || (c.state === "connecting" && Date.now() - (c.liveTriedAt || 0) < 25000))) {
     return sendJson(res, 409, { error: "This call is already connected in another tab or window. Use that one, or end it first." });
   }
   const { key, source } = resolveKey();
@@ -966,11 +971,14 @@ async function postLive(res, c, body) {
     });
   }
   c.liveId = (j.session && j.session.id) || null;
+  /* Only the tab that opened this attempt may call it off: a second tab of the same call whose own
+     Start was refused posts a reset too, and that must not clear the attempt it lost to. */
+  c.liveAttempt = crypto.randomBytes(12).toString("base64url");
   c.liveTriedAt = Date.now();
   if (c.state === "created") c.state = "connecting";
   remember(c, "system", `voice session ${c.liveId || "?"} opened on ${MODEL}`);
   pushStatus();
-  return sendJson(res, 200, { sdp: j.transport.sdp, id: c.liveId, model: MODEL });
+  return sendJson(res, 200, { sdp: j.transport.sdp, id: c.liveId, attempt: c.liveAttempt, model: MODEL });
 }
 
 function postState(res, c, body) {
@@ -1012,7 +1020,11 @@ function postState(res, c, body) {
   }
   if (s === "reset") {
     // The page gave up on a connect attempt (cancelled, or it failed): the call itself goes on.
-    if (c.state === "connecting") { c.state = "created"; c.liveId = null; remember(c, "system", "connect attempt abandoned"); pushStatus(); }
+    if (c.state === "connecting" && c.liveAttempt && tokenOk(body.attempt, c.liveAttempt)) {
+      c.state = "created"; c.liveId = null; c.liveAttempt = null;
+      remember(c, "system", "connect attempt abandoned");
+      pushStatus();
+    }
     return sendJson(res, 200, { ok: true });
   }
   return sendJson(res, 400, { error: "state must be live, closed or reset" });
@@ -1588,19 +1600,19 @@ function untoldStops(c) {
   return lines.join("\n");
 }
 
-/* Call 29-Sep-2026: the browser had already opened the page, spending the one-time link, and Claude
-   still showed the user the link, cut down to the bare port; the user followed that instead of the
-   tab. So when the browser opened, the tab is the call and the link is not for the user. It stays
-   in the text for the one case where no tab appeared, and then it still works, because nothing used
-   it. Without a browser the link goes to the user whole: cut short it opens nothing, and it is safe
+/* Two calls on 29-Sep-2026: the browser had already opened the page, spending the one-time link,
+   and Claude showed the user a link anyway, once cut down to the bare port and once whole as a
+   fallback; both times the user followed it instead of the tab. So when the browser opened, the
+   one link Claude gets is the page's own address: it holds no code, it is safe to paste, and in the
+   browser that just opened the call it reaches the call itself. Without a browser the one-time
+   link is the only way in, so it goes to the user whole: cut short it opens nothing, and it is safe
    to show because it dies on first use. */
 export function callStartText({ url, opened, reopen = false, state = "", key = { key: "" }, port: p, id }) {
   return [
-    reopen ? `The call was already open (${state}); a fresh one-time link to its page was made.` : "",
+    reopen ? `The call was already open (${state}); ${opened ? "its page was opened again" : "this is a fresh link to its page"}.` : "",
     ...(opened ? [
       `The call page opened in the user's browser, in a tab titled "Kivi Talk". That tab is the call.`,
-      "Tell the user in one short line to switch to the Kivi Talk tab and press Start talking. Do not paste, shorten or retype the link in chat: it works only once, and the browser already used it.",
-      `Only if the user says no Kivi Talk tab appeared, give them this link exactly as written, all of it: ${url}`,
+      `In one short line, tell the user to press Start talking in the Kivi Talk tab. If you give a link, give only this one, exactly as written: http://127.0.0.1:${p}/c/${id}/`,
     ] : [
       `Kivi Talk could not open the browser. In one short line, give the user this one-time link exactly as written, all of it, and tell them to press Start talking on the page it opens: ${url}`,
       "It is safe to show (it stops working once opened), and cut short it does not open the call.",

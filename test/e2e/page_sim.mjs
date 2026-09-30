@@ -1240,6 +1240,49 @@ def(19, "an upload still running: a spoken request waits for it, a typed one sur
   check(reloaded.stops === 0 && reloaded.hidden && reloaded.status === "This call has ended.", "a reloaded ended page lists no open requests and no Stop buttons", JSON.stringify(reloaded));
 });
 
+/* 0.6.3, the second live failure on 29-Sep: the browser opened the call by itself (here the
+   harness's tab, live), then the same browser opened the same one-time link again from the chat
+   and got "This call link was already used". It must land on the call page, and a second tab of
+   one call must never start a second voice session or disturb the live one. */
+def(20, "the same browser opens the spent link again: a second tab of the live call that cannot start another voice", async ({ b, page, mock, check, ctx }) => {
+  const sessions = () => mock.seen.filter((s) => s.url === "/v1/live/sessions").length;
+  const tabB = await ctx.newPage();
+  await tabB.evaluateOnNewDocument(pageStub);
+  const r = await tabB.goto(b.launchUrl(), { waitUntil: "domcontentloaded" });
+  const where = tabB.url().replace(/^https?:\/\/[^/]+/, "");
+  check(r.status() === 200 && where === new URL(page.url()).pathname, "the spent link lands on the call page in the browser that holds the cookie",
+    `${r.status()} ${where.replace(/[a-f0-9]{12}/, "<id>")}`);
+  const st = await until(async () => { const s = await status(tabB); return s.startsWith("This call is live in another tab") ? s : null; }, 5000,
+    "the second tab to say where the call is").catch(() => status(tabB));
+  check(st.startsWith("This call is live in another tab"), "the second tab says the call is live in another tab", st);
+  const go = await tabB.$eval("#go", (el) => ({ text: el.textContent, disabled: el.disabled }));
+  check(go.disabled && go.text === "Live in another tab", "its button cannot start a second voice", JSON.stringify(go));
+  await tabB.bringToFront();
+  await tabB.click("#go").catch(() => {});
+  await sleep(1500);
+  check(sessions() === 1, "still exactly one voice session", sessions());
+  await page.bringToFront();
+  check((await page.$eval("#go", (el) => el.textContent)) === "End call", "the live tab is still live");
+  check(JSON.parse(await b.tool("call_status")).state === "live", "the bridge still has the call live");
+
+  // Claude's answer shows in both tabs; only the tab with the voice passes it to OpenAI.
+  const got = await delegate(b, page, "how many tests are there", "d20");
+  check(/^REQUEST r1 /.test(got.text), "a request from the live tab reaches Claude", firstLine(got.text));
+  await b.tool("call_say", { id: "r1", text: "There are one hundred and ten." });
+  const inB = await until(async () => (await logLines(tabB)).some((l) => l.text === "There are one hundred and ten."), 5000, "the answer in the second tab").catch(() => false);
+  check(inB, "the answer shows in the second tab too");
+  check((await tabB.evaluate(() => window.__sent.length)) === 0, "the second tab sent nothing to any voice");
+  check((await commentaries(page)).some((c) => /one hundred and ten/.test(c.content)), "the live tab passed the answer to its voice");
+
+  // Hanging up in the live tab ends the call in both.
+  await page.click("#go");
+  await live(page, { type: "session.closed", usage: { seconds: 20 } });
+  const endB = await until(async () => { const s = await status(tabB); return /ended/i.test(s) ? s : null; }, 6000, "the second tab to see the end").catch(() => status(tabB));
+  check(/ended/i.test(endB), "the second tab shows the call ended", endB);
+  check(JSON.parse(await b.tool("call_status")).state === "ended", "the bridge ended the call");
+  await Promise.race([tabB.close(), sleep(3000)]);
+});
+
 /* ---------------------------------------------------------------- run -- */
 
 const puppeteer = createRequire(PUPPETEER_FROM)("puppeteer-core");

@@ -17,10 +17,10 @@ Focus the user gave (may be empty): $ARGUMENTS
 
 1. Call `call_start` with `focus` set to the focus above (omit it if empty).
 2. Tell the user in ONE short line to press **Start talking**, the way the `call_start` result
-   says. When the browser opened the page, point them to the browser tab titled **Kivi Talk** and
-   do not paste, shorten or retype the link: it works only once, and the browser already used it.
-   Only when the result says the browser could not be opened, give them the link exactly as
-   written, all of it.
+   says. When the browser opened the page, the call is the browser tab titled **Kivi Talk**; if you
+   give a link, give only the page link the result names (it holds no code). Only when the result
+   says the browser could not be opened, give them the one-time link instead, exactly as written,
+   all of it: it is the only way in.
 3. Go straight into the loop.
 
 ## The loop

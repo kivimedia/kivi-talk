@@ -261,6 +261,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
   var endSeen = false;       // the bridge said the call is over (frames after that are the wind-down)
   var frameN = 0, endFrameN = -1;   // frames from the bridge, counted (see onAttachments)
   var cancelledAt = 0;       // the user's last spoken "stop" (see onDelegation)
+  var serverState = CFG.state || "created";   // the call at the bridge, which another tab can take live
+  var liveAttempt = null;    // this tab's own connect attempt, the only one it may call off
 
   /* A caller can only trust a status line that says exactly what is happening now. */
   function setStatus(main, detail) {
@@ -284,6 +286,21 @@ button.small { padding: 6px 10px; font-size: 14px; }
     log.appendChild(li);
     if (atBottom) log.scrollTop = log.scrollHeight;
     return li;
+  }
+
+  /* Two tabs of one call are normal: the one the browser opened by itself and the one the user
+     clicked in the chat. Only one of them can hold the voice (the bridge refuses a second), so a
+     tab that sees the call go live without it says where the call is instead of offering Start. */
+  function elsewhere() { return phase === "idle" && serverState === "live"; }
+  function showElsewhere() {
+    setStatus("This call is live in another tab.", "Talk in the Kivi Talk tab where Start was pressed. This tab shows the same call.");
+  }
+  function noteServerState(s) {
+    if (!s || s === serverState) return;
+    var was = elsewhere();
+    serverState = s;
+    if (elsewhere() && !was) showElsewhere();
+    render();
   }
 
   function showInterim(who, text) { $("interim").textContent = who + ": " + text; }
@@ -314,6 +331,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
     else if (phase === "live") { go.textContent = "End call"; go.className = "stop"; }
     else if (phase === "closing") { go.textContent = "Hanging up..."; go.disabled = true; }
     else { go.textContent = "Call ended"; go.disabled = true; }
+    if (elsewhere()) { go.textContent = "Live in another tab"; go.disabled = true; }
     $("mute").hidden = phase !== "live";
     $("attach").disabled = phase === "ended";
 
@@ -362,6 +380,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
       if (Array.isArray(m.items)) setItems(m.items);
       if (Array.isArray(m.pending)) onAttachments(m.pending);
+      noteServerState(m.state);
       if (m.state === "ended") {
         endSeen = true;
         if (phase === "live" || phase === "connecting") hangUp("Claude ended the call.");
@@ -380,6 +399,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       if (m.claude === "working" && claude.claude !== "working") workingSince = Date.now();
       claude = { claude: m.claude, queue: m.queue || 0, on: m.on || "" };
       if (Array.isArray(m.items)) setItems(m.items);
+      noteServerState(m.state);
       renderClaude();
       return;
     }
@@ -534,12 +554,16 @@ button.small { padding: 6px 10px; font-size: 14px; }
      open for another try; only End call (phase live) ends it. A double click would otherwise
      start a connection and then cancel it, or worse, end the call. */
   var lastGoClick = 0;
+  function callOff() {
+    if (liveAttempt) api("/state", { state: "reset", attempt: liveAttempt }).catch(noop);
+    liveAttempt = null;
+  }
   function cancelConnect() {
     clearTimeout(connectTimer);
     teardown();
     phase = "idle";
     render();
-    api("/state", { state: "reset" }).catch(noop);
+    callOff();
     setStatus("Cancelled.", "Nothing is connected. Press Start talking to try again.");
   }
 
@@ -550,6 +574,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
     if (phase === "live") { hangUp("You ended the call."); return; }
     if (phase === "connecting") { cancelConnect(); return; }
     if (phase !== "idle") return;
+    if (elsewhere()) { showElsewhere(); return; }
     if (!CFG.keyPresent) { showKey(); setStatus("Add your OpenAI key to start.", "It is used only to open the voice session."); return; }
     phase = "connecting";
     render();
@@ -587,7 +612,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
         if (j.needKey) { CFG.keyPresent = false; render(); showKey(j.error); }
         throw new Error(j.error || "OpenAI would not open the voice session.");
       }
-      if (phase !== "connecting") { teardown(); return; }
+      liveAttempt = j.attempt || null;
+      if (phase !== "connecting") { teardown(); callOff(); return; }
       await pc.setRemoteDescription({ type: "answer", sdp: j.sdp });
       setStatus("Connecting audio...", "Waiting for OpenAI to start the session.");
       connectTimer = setTimeout(function () {
@@ -597,7 +623,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
       }, 20000);
     } catch (e) {
       teardown();
-      if (phase === "connecting") { phase = "idle"; api("/state", { state: "reset" }).catch(noop); }
+      if (phase === "connecting") { phase = "idle"; callOff(); }
       render();
       var msg = String((e && e.message) || e);
       if (e && e.name === "NotAllowedError") msg = "The browser blocked the microphone. Allow it for this page and press Start again.";
@@ -2120,6 +2146,8 @@ button.small { padding: 6px 10px; font-size: 14px; }
     setItems([]);
     render();
     setStatus("This call has ended.", (CFG.endReason || "") + " Run /talk in Claude to call again.");
+  } else if (elsewhere()) {
+    showElsewhere();
   } else if (!CFG.keyPresent) {
     showKey();
     setStatus("Add your OpenAI key, then press Start talking.", "One time only. It stays on this computer.");

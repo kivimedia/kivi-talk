@@ -1,6 +1,6 @@
 {
   "name": "kivi-talk",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "license": "Apache-2.0",
   "description": "Kivi Talk: talk out loud to your Claude Code session (voice powered by OpenAI GPT-Live, your own key).",
