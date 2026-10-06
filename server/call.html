@@ -868,9 +868,11 @@ button.small { padding: 6px 10px; font-size: 14px; }
     if (phase !== "live" || delegating || !sinceHandover.length) return;
     var now = Date.now();
     if (awaitingSince && now - awaitingSince < AWAIT_MAX_MS) { overhearTimer = setTimeout(overhear, 2000); return; }
+    var dictated = false;
     if (listening) {
       if (now - lastHeardAt < LISTEN_QUIET_MS) { overhearTimer = setTimeout(overhear, 5000); return; }
       listening = false;
+      dictated = true;
     }
     // Someone is still talking, or the voice may be about to delegate after its reply: look again.
     if (heardBuf.trim() || saidBuf.trim() || now - lastHeardAt < 1500 || now - lastSaidAt < 2000) {
@@ -881,6 +883,14 @@ button.small { padding: 6px 10px; font-size: 14px; }
     var chat = !claudeAsked && sinceHandover.every(function (t) { return SMALLTALK.test(t) || HANGUP.test(t) || CANCEL.test(t); });
     var said = sinceHandover.splice(0);
     if (chat) return;
+    /* Call 2729f1c93fbb: "So what's happening right now", asked while Claude worked and answered
+       by the voice, still became a queued task. Talk like that, said while Claude is busy and
+       answered by the voice, goes as an aside: Claude reads it at its next step, the queue stays
+       for tasks. Not dictation and not a reply to Claude's own question. */
+    if (!claudeAsked && !dictated && lastSaidAt > lastHeardAt && (newestItem("working") || newestItem("queued"))) {
+      handOver(null, said, "aside");
+      return;
+    }
     addLine("Call", "the voice did not pass that on, so it went to Claude directly", "note");
     handOver(null, said, "overheard");
   }
@@ -888,7 +898,7 @@ button.small { padding: 6px 10px; font-size: 14px; }
   async function handOver(id, said, source) {
     clearTimeout(overhearTimer);
     claudeAsked = false;
-    if (said.length) setStatus("Handing your request to Claude...", said.join(" "));
+    if (said.length && source !== "aside") setStatus("Handing your request to Claude...", said.join(" "));
     // "What is wrong in this?" said while its screenshot still uploads: the file goes with it.
     await uploadsSettled();
     // Ended while it waited: its lines are in the hang-up already, and the end-of-call hand-off has them.
@@ -908,6 +918,14 @@ button.small { padding: 6px 10px; font-size: 14px; }
       return;
     }
     lastActivity = Date.now();
+    /* A side note is no request: nothing to wait on, and the voice has already answered it. The
+       bridge makes it a request after all when Claude turns out to be idle. */
+    if (source === "aside") {
+      addLine("Call", j.aside ? "Claude is busy and the voice answered that, so it went to Claude as a side note, not a new task"
+        : "the voice did not pass that on, so it went to Claude directly", "note");
+      if (!j.aside && !j.attached && !j.answered) awaitingSince = Date.now();
+      return;
+    }
     if (!j.attached && !j.answered) awaitingSince = Date.now();
     if (j.answered) {
       commentary(id, "Claude has already answered this; you passed its answer on just now. Say nothing more about it unless the user asks.");

@@ -85,19 +85,88 @@ test("the voice briefing defines listening mode as opt-in", async () => {
 });
 
 /* Call 0e88e803c97a, 26-Sep: asked "what will persist once I end the call?", the voice answered
-   it itself ("nothing carries over", which is false) and Claude never heard the question. */
-test("the voice briefing hands everything but a greeting, thanks or goodbye to Claude", async () => {
+   it itself ("nothing carries over", which is false) and Claude never heard the question. So every
+   question about the work or the call is still a task.
+   Call 2729f1c93fbb, 6-Oct: "I think I already said over to you" and "But I kept the first task
+   on" were delegated and queued as tasks; the user cancelled both and asked for a way to tell a
+   task from talk. Remarks, reactions and status questions stay with the voice. */
+test("the voice briefing gates tasks from talk, and a question about the work or the call is a task", async () => {
   const oa = await mockOpenAI();
   const { b, page } = await started({ TTC_OPENAI_BASE: oa.base, TTC_OPENAI_API_KEY: KEY });
   try {
     await page.post("live", { sdp: "v=0 offer" });
     const brief = JSON.parse(oa.seen.find((s) => s.url === "/v1/live/sessions").body).session.instructions;
-    assert.doesNotMatch(brief, /small talk you may answer yourself/i, "small talk is no longer the voice's to answer");
-    assert.match(brief, /Hand EVERYTHING the user says to Claude/);
-    assert.match(brief, /questions about you, about Claude, about this call/);
-    assert.match(brief, /only exceptions/i);
+    assert.doesNotMatch(brief, /Hand EVERYTHING the user says to Claude/, "talk is no longer delegated");
+    assert.match(brief, /A TASK goes to Claude/);
+    assert.match(brief, /every question about the work[^.]*what is kept after the call/, "the 26-Sep question is still a task");
+    assert.match(brief, /TALK stays with you and is never delegated/);
+    assert.match(brief, /a remark about this call or about what the user just did/);
+    assert.match(brief, /a status question about work already handed over/);
+    assert.match(brief, /not sure whether they did, it is a task/i, "unsure means delegate");
+    assert.match(brief, /never a result/, "a status answer never invents what Claude found");
     assert.match(brief, /everything said on this call is kept/i, "if it ever does speak about it, it says the truth");
   } finally { b.stop(); oa.close(); }
+});
+
+/* Call 2729f1c93fbb, 6-Oct: "So what's happening right now", asked while Claude worked on r1, was
+   answered by the voice and still queued as r2, a task Claude would only reach after r1. */
+test("an aside said while Claude works is no new task: it rides on Claude's next tool result once", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("state", { state: "live" });
+    await page.post("transcript", { role: "user", text: "price a reliable new computer" });
+    await page.post("delegate", { delegation_id: "d1", said: ["price a reliable new computer"], recent: [] });
+    await b.tool("call_next", { wait_seconds: 5 });                       // r1 in flight
+    await page.post("transcript", { role: "user", text: "So what's happening right now" });
+    await page.post("transcript", { role: "voice", text: "Claude is working on it." });
+    const r = await page.post("delegate", { delegation_id: null, source: "aside", said: ["So what's happening right now"],
+      recent: [{ role: "user", text: "So what's happening right now" }, { role: "voice", text: "Claude is working on it." }] });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.aside, true);
+    const st = JSON.parse(await b.tool("call_status"));
+    assert.equal(st.queued.length, 0, "no request was queued for it");
+    assert.deepEqual(st.inFlight.map((x) => x.id), ["r1"]);
+    const said = await b.tool("call_say", { id: "r1", text: "Still pulling prices.", final: false });
+    assert.match(said, /^Said on the call while you worked/);
+    assert.match(said, /User: So what's happening right now/);
+    assert.match(said, /Voice: Claude is working on it\./);
+    assert.match(said, /not a new request/);
+    assert.match(said, /\n\n[^\n]*Now call call_next\.$/, "call_say's own result follows it");
+    assert.doesNotMatch(await b.tool("call_say", { id: "r1", text: "Done." }), /while you worked/, "told once");
+    await page.post("state", { state: "closed", reason: "bye" });
+    const end = await b.tool("call_next", { wait_seconds: 5 });
+    assert.doesNotMatch(end, /NOT HANDED OVER[^:]*: So what's happening right now/, "it reached Claude, so it is not flagged");
+    assert.doesNotMatch(end, /REQUEST r2/);
+  } finally { b.stop(); }
+});
+
+test("an aside Claude never got to read is flagged at the end of the call, not lost", async () => {
+  const { b, page } = await started();
+  try {
+    await page.post("state", { state: "live" });
+    await page.post("typed", { text: "price a reliable new computer" });
+    await b.tool("call_next", { wait_seconds: 5 });
+    await page.post("transcript", { role: "user", text: "that's why I stopped the other two" });
+    assert.equal((await page.post("delegate", { delegation_id: null, source: "aside", said: ["that's why I stopped the other two"], recent: [] })).json.aside, true);
+    await page.post("state", { state: "closed", reason: "bye" });
+    const end = await b.tool("call_next", { wait_seconds: 5 });
+    assert.match(end, /User \(NOT HANDED OVER to you during the call\): that's why I stopped the other two/);
+  } finally { b.stop(); }
+});
+
+test("an aside with nothing open, or with Claude waiting for speech, is handed over as an overheard request", async () => {
+  const { b, page } = await started();
+  try {
+    const r = await page.post("delegate", { delegation_id: null, source: "aside", said: ["so what's happening"], recent: [] });
+    assert.equal(r.status, 200);
+    assert.ok(!r.json.aside, "nothing open: not an aside");
+    assert.match(await b.tool("call_next", { wait_seconds: 5 }), /^REQUEST r1 \(spoken by the user[^)]*the voice did not hand this over/);
+    // r1 is still open, but Claude is idle in call_next: it would never see an aside until it woke.
+    const next = b.tool("call_next", { wait_seconds: 10 });
+    await sleep(150);
+    assert.ok(!(await page.post("delegate", { delegation_id: null, source: "aside", said: ["and also the budget is four thousand"], recent: [] })).json.aside);
+    assert.match(await next, /^REQUEST r2 \(spoken by the user[^)]*the voice did not hand this over[^)]*\):\n"and also the budget is four thousand"/);
+  } finally { b.stop(); }
 });
 
 test("speech the voice did not hand over reaches Claude anyway, labelled as such", async () => {

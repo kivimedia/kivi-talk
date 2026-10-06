@@ -1283,6 +1283,43 @@ def(20, "the same browser opens the spent link again: a second tab of the live c
   await Promise.race([tabB.close(), sleep(3000)]);
 });
 
+/* Call 2729f1c93fbb, 6-Oct: while Claude worked on r1 the user asked "So what's happening right
+   now", the voice answered it, and the page still queued it as r2, a task. Talk said while Claude
+   works and answered by the voice is a side note now; a real new ask is still a task. */
+def(21, "talk while Claude works: a status question the voice answered is a side note, not a queued task", async ({ b, page, check }) => {
+  const got = await delegate(b, page, "Price a reliable new computer for me.", "d21");
+  check(/^REQUEST r1 /.test(got.text), "r1 is with Claude", firstLine(got.text));
+  await b.tool("call_say", { id: "r1", text: "Checking prices now.", final: false });
+  await until(async () => (await commentaries(page)).find((m) => m.content.includes("Checking prices now.")), 4000, "the progress note as commentary");
+  await sleep(600);
+  const Q = "Awesome. So what's happening right now";
+  await userSays(page, Q);
+  await sleep(800);
+  await voiceSays(page, "Claude is still checking prices.");
+  await sleep(11000);   // well past the page's 6 s overhear window
+  const st = JSON.parse(await b.tool("call_status"));
+  check(st.queued.length === 0 && st.inFlight.length === 1, "nothing was queued for it; only r1 is open", `queued=${JSON.stringify(st.queued)} inFlight=${st.inFlight.length}`);
+  check(requests(b).length === 1, "still exactly one request", JSON.stringify(requests(b)));
+  const note = (await logLines(page)).find((l) => /side note, not a new task/.test(l.text));
+  check(Boolean(note), "the page log says it went to Claude as a side note", note && note.text);
+  check(!(await commentaries(page)).some((m) => /queued/i.test(m.content)), "the voice was never told it is queued");
+  const said = await b.tool("call_say", { id: "r1", text: "Still checking.", final: false });
+  check(said.startsWith("Said on the call while you worked") && said.includes("User: " + Q) && said.includes("Voice: Claude is still checking prices."),
+    "Claude's next call_say carries it, with the voice's answer", said.split("\n").slice(0, 3).join(" / "));
+  const again = await b.tool("call_say", { id: "r1", text: "Almost there.", final: false });
+  check(!again.includes("while you worked"), "told once");
+
+  // A real new ask while Claude still works is a task: the voice delegates it and it is queued.
+  const ASK = "Also add a quiet case to the list.";
+  await userSays(page, ASK);
+  await sleep(1000);
+  await delegation(page, "d21b");
+  await sleep(150);
+  await voiceSays(page, "On it.");
+  const q = await until(async () => { const s = JSON.parse(await b.tool("call_status")); return s.queued.length ? s.queued : null; }, 6000, "the new ask in the queue");
+  check(q.length === 1 && q[0].text === ASK, "the new ask is queued as a task", JSON.stringify(q));
+});
+
 /* ---------------------------------------------------------------- run -- */
 
 const puppeteer = createRequire(PUPPETEER_FROM)("puppeteer-core");

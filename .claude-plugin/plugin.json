@@ -1,6 +1,6 @@
 {
   "name": "kivi-talk",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Kivi Talk: talk out loud to the Claude Code session you are in. The voice is powered by OpenAI GPT-Live on your own OpenAI key; your session does the work with its own tools while you talk. Type /talk.",
   "author": { "name": "Kivi Media", "url": "https://github.com/kivimedia" },
   "repository": "https://github.com/kivimedia/kivi-talk",

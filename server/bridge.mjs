@@ -26,7 +26,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.6.3";
+export const VERSION = "0.6.4";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 
@@ -153,6 +153,7 @@ function newCall(focus) {
     createdAt: Date.now(), liveAt: 0, endedAt: 0, endReason: "",
     queue: [],                  // requests Claude has not picked up yet
     inFlight: new Map(),        // id -> request Claude picked up and has not answered
+    asides: [],                 // { said, recent }: talk said while Claude worked, for its next tool result
     seq: 0,
     waiter: null,               // the blocked call_next, if any
     lastLoopAt: 0,              // last time Claude touched call_next/call_say
@@ -586,10 +587,11 @@ export function voiceInstructions(focus) {
     `You are the voice of Claude, an AI agent working on the user's computer${project ? ` in the folder "${project}"` : ""}. The user is talking to you out loud.`,
     "You cannot see the screen, read files, run anything or look anything up yourself. Claude can: it has its own tools on this computer and works on one request at a time. You are its voice.",
     "",
-    "How to handle what the user says:",
-    "- Hand EVERYTHING the user says to Claude (delegate): every request, instruction, idea, decision and question, including questions about you, about Claude, about this call, what you or Claude can do, and what is remembered. Say a very short acknowledgement first, such as \"On it.\" or \"Let me check.\", then stop talking and wait.",
-    "- The only exceptions, which you answer yourself in one short sentence: a bare greeting, a thank-you, or a goodbye. Anything more than that goes to Claude, even if you think you know the answer.",
-    "- Never answer a question yourself and never explain how this call works. You do not know; Claude does. If you ever have to say it: everything said on this call is kept and handed to Claude, which works on it during the call and, when the call ends, reads the whole conversation and finishes anything left over.",
+    "How to handle what the user says. First decide: is it a task for Claude, or just talk?",
+    "- A TASK goes to Claude (delegate): anything that asks Claude to do, check, find, change, make, fix, explain or decide something; every question about the work, the files, a result, what you or Claude can do, or what is kept after the call; a new idea, decision or correction for the work. Say a very short acknowledgement first, such as \"On it.\" or \"Let me check.\", then stop talking and wait.",
+    "- TALK stays with you and is never delegated: a greeting, thanks or goodbye; a reaction or thinking out loud with no ask (\"awesome\", \"hmm, that's annoying\"); a remark about this call or about what the user just did (\"I already said over to you\", \"I stopped that one because it wasn't a task\"); and a status question about work already handed over (\"what's happening?\", \"are you still on it?\", \"did you get that?\"). Answer talk yourself in one short sentence, or just \"Got it.\" A status answer says only what Claude last told you (what it is working on, what is waiting), never a result.",
+    "- Talk is not lost: every word on this call is kept and Claude reads it at its next step, so never delegate talk just to be safe. But if the user asks for anything, or you are not sure whether they did, it is a task: delegate it.",
+    "- Never answer a question about the work yourself and never explain how this call works. You do not know; Claude does. If you ever have to say it: everything said on this call is kept and handed to Claude, which works on it during the call and, when the call ends, reads the whole conversation and finishes anything left over.",
     "- When Claude's answer arrives, say it in your own words, briefly. Keep numbers, names, file names and commands exactly as given. Never invent a result and never guess what Claude found.",
     "- A progress note from Claude: pass it on in a few words. The work is still running.",
     "- While you wait, stay quiet unless the user speaks. If they ask, say Claude is still working.",
@@ -1058,8 +1060,17 @@ function postDelegate(res, c, body) {
     return sendJson(res, 400, { error: "I did not catch a request there. Could you say it again?" });
   }
   const t = textSaid;
+  /* An aside is talk the voice kept and answered while Claude works: "what's happening right
+     now?", "I stopped that one because...". Call 2729f1c93fbb queued such lines as tasks and the
+     user had to cancel them. It takes no queue slot; it rides on Claude's next tool result. Only
+     while Claude is busy, though: with nothing open, or Claude idle in call_next, nothing would
+     carry it, so it goes over as an overheard request as before. */
+  if (!id && body.source === "aside" && !c.waiter && (c.inFlight.size || c.queue.length)) {
+    c.asides.push({ said, recent: recent.slice(-12) });
+    return sendJson(res, 200, { aside: true });
+  }
   // Only a hand-over with no delegation of the voice's own can be one the voice did not make.
-  const source = !id && body.source === "overheard" ? "overheard" : "voice";
+  const source = !id && (body.source === "overheard" || body.source === "aside") ? "overheard" : "voice";
   const { r, ahead, claudeWaiting } = enqueue(c, t, recent, id, source, said);
   return sendJson(res, 200, { id: r.id, ahead, claudeWaiting, claude: claudeStatus(c).claude });
 }
@@ -1586,8 +1597,27 @@ async function toolCall(name, args, ctx) {
   if (!result || name === "call_start" || name === "call_status" || !call || !isOpen(call)) return result;
   const said = result.content[0].text;
   if (said.startsWith("Superseded:")) return result;   // Claude ignores this one, so it cannot carry news
-  const stops = untoldStops(call);
-  return stops ? { ...result, content: [{ type: "text", text: stops + "\n\n" + said }] } : result;
+  const news = [untoldStops(call), untoldAsides(call)].filter(Boolean).join("\n\n");
+  return news ? { ...result, content: [{ type: "text", text: news + "\n\n" + said }] } : result;
+}
+
+/* Talk said while Claude worked, told once. Only now has it reached Claude, so only now does it
+   count as handed over; an aside still waiting when the call ends is flagged in the hand-off. */
+function untoldAsides(c) {
+  if (!c.asides.length) return "";
+  const lines = [];
+  for (const a of c.asides.splice(0)) {
+    for (const s of a.said) { markHanded(c, s); lines.push(`User: ${clip(s, 600)}`); }
+    // The voice's reply is what came after the last of these lines in the page's recent context.
+    const last = norm(a.said.at(-1));
+    const at = a.recent.map((l) => norm(l && l.text)).lastIndexOf(last);
+    if (at >= 0) for (const l of a.recent.slice(at + 1)) if (l && l.role === "voice") lines.push(`Voice: ${clip(l.text, 600)}`);
+  }
+  return [
+    "Said on the call while you worked (talk the voice kept, not a new request; the voice may already have answered it):",
+    ...lines,
+    "Nothing to do unless it asks you for something or the voice got it wrong. If it does, treat it as a request the user just made: do it after the current one and answer it with call_say.",
+  ].join("\n");
 }
 
 function untoldStops(c) {

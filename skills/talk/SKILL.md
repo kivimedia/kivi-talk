@@ -39,6 +39,11 @@ Repeat until `call_next` says the call ended:
      task's result; handle it when it does.
    - A result that starts with `STOP rN`: the user cancelled that request. See **When the user
      cancels** below.
+   - Any `call_*` result may start with "Said on the call while you worked": talk the user said
+     while you were busy (a status question, a remark, a reaction) that the voice kept and
+     usually already answered. It is not a new request: keep going with the current one. Only if
+     it does ask you for something, or the voice told the user something wrong, treat it as a
+     request the user just made: do it after the current one and answer it with `call_say`.
    - `CALL ENDED`: stop looping and go to **When the call ends** below.
 2. Do the work. Use whatever tools the task needs, exactly as you would for a typed request.
 3. If it will take more than about 15 seconds, first send a progress note:
